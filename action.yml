@@ -1,0 +1,28 @@
+name: 'Warden // CI/CD Security Scanner'
+description: 'Find and fix GitHub Actions vulnerabilities: unpinned actions, script injection, secret exfiltration, and 50+ more rules.'
+branding:
+  icon: 'shield'
+  color: 'blue'
+inputs:
+  path:
+    description: 'Path to scan'
+    default: '.'
+  fail-on:
+    description: 'Minimum severity to fail (critical, high, medium, low, none)'
+    default: 'high'
+  format:
+    description: 'Output format (console, json, sarif, markdown)'
+    default: 'console'
+outputs:
+  results-json:
+    description: 'JSON findings payload for downstream steps (populate by running warden with format=json and piping stdout into $GITHUB_OUTPUT).'
+runs:
+  using: 'docker'
+  image: 'Dockerfile'
+  args:
+    - scan
+    - ${{ inputs.path }}
+    - '--fail-on'
+    - ${{ inputs.fail-on }}
+    - '--format'
+    - ${{ inputs.format }}

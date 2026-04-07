@@ -1,0 +1,25 @@
+# Rust
+target/
+
+# Web app build artifacts (kept at root so both main and public ignore them)
+web/node_modules/
+web/.next/
+web/out/
+web/tsconfig.tsbuildinfo
+
+# Docs build output
+docs/book/
+
+# OS
+.DS_Store
+*.swp
+*~
+
+# Env
+.env
+.env.local
+
+# Local agent / personal docs
+.local/
+CLAUDE.md
+RELEASE.md

@@ -1,0 +1,9 @@
+[book]
+title = "Warden Documentation"
+authors = ["projectwarden"]
+language = "en"
+
+[output.html]
+default-theme = "rust"
+preferred-dark-theme = "rust"
+git-repository-url = "https://github.com/projectwarden/warden"

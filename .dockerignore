@@ -1,0 +1,31 @@
+# Build artifacts (Rust)
+target/
+
+# Web app // not needed for the Rust binary build, defense in depth so even
+# if someone copies . into a Dockerfile by accident, web/ secrets cannot leak
+web/
+
+# Env files // never include any of these in the build context
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# Local agent / personal docs (gitignored too, double-belt)
+.local/
+CLAUDE.md
+RELEASE.md
+USER_TODO.md
+
+# VCS + OS
+.git/
+.gitignore
+.DS_Store
+*.swp
+*~
+
+# Logs
+*.log
+
+# Docs build output
+docs/book/

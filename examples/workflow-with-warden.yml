@@ -1,0 +1,50 @@
+# Example workflow showing how to run warden on every pull request
+# and post a markdown summary as a PR comment.
+#
+# Drop this file in your repo as .github/workflows/warden.yml.
+
+name: warden
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/**'
+      - '.warden.toml'
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      # Run warden in markdown mode and capture the output.
+      - name: Run warden (markdown)
+        id: warden
+        uses: projectwarden/warden@v1
+        with:
+          path: '.'
+          fail-on: high
+          format: markdown
+        continue-on-error: true
+
+      # Alternatively, run warden directly and redirect to a file so we
+      # can post it as a comment even if the action exits non-zero.
+      - name: Run warden (direct)
+        if: always()
+        run: |
+          docker run --rm -v "$PWD":/src -w /src ghcr.io/projectwarden/warden:latest \
+            scan . --format markdown --fail-on none > warden-report.md || true
+
+      - name: Post PR comment
+        if: github.event_name == 'pull_request' && always()
+        uses: peter-evans/create-or-update-comment@e8674b075228eee787fea43ef493e45ece1004c9  # v5.0.0
+        with:
+          issue-number: ${{ github.event.pull_request.number }}
+          body-path: warden-report.md
+          edit-mode: replace
