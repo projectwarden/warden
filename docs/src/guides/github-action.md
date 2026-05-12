@@ -38,7 +38,7 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
-      - uses: projectwarden/warden@a3c26c3f1897ddbe5c34cc3ce9ff4f14f84c83a8  # v2.0.0
+      - uses: projectwarden/warden@e4f665f5171ef446d79cc5c268af6606d78aaf04  # v2.0.0
         with:
           path: .github/workflows
 ```
@@ -62,19 +62,19 @@ jobs:
 Set `fail-on` to control which severity level causes the action to exit non-zero:
 
 ```yaml
-- uses: projectwarden/warden@a3c26c3f1897ddbe5c34cc3ce9ff4f14f84c83a8  # v2.0.0
+- uses: projectwarden/warden@e4f665f5171ef446d79cc5c268af6606d78aaf04  # v2.0.0
   with:
     fail-on: critical   # only fail on critical findings
 ```
 
 ```yaml
-- uses: projectwarden/warden@a3c26c3f1897ddbe5c34cc3ce9ff4f14f84c83a8  # v2.0.0
+- uses: projectwarden/warden@e4f665f5171ef446d79cc5c268af6606d78aaf04  # v2.0.0
   with:
     fail-on: medium     # fail on medium, high, and critical
 ```
 
 ```yaml
-- uses: projectwarden/warden@a3c26c3f1897ddbe5c34cc3ce9ff4f14f84c83a8  # v2.0.0
+- uses: projectwarden/warden@e4f665f5171ef446d79cc5c268af6606d78aaf04  # v2.0.0
   with:
     fail-on: none       # never fail (reporting only)
 ```
@@ -86,7 +86,7 @@ To upload results to GitHub Code Scanning, run warden a second time with
 can read:
 
 ```yaml
-- uses: projectwarden/warden@a3c26c3f1897ddbe5c34cc3ce9ff4f14f84c83a8  # v2.0.0
+- uses: projectwarden/warden@e4f665f5171ef446d79cc5c268af6606d78aaf04  # v2.0.0
   with:
     fail-on: none   # let Code Scanning handle enforcement
 
@@ -122,7 +122,7 @@ jobs:
       checks: write  # required for annotations
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
-      - uses: projectwarden/warden@a3c26c3f1897ddbe5c34cc3ce9ff4f14f84c83a8  # v2.0.0
+      - uses: projectwarden/warden@e4f665f5171ef446d79cc5c268af6606d78aaf04  # v2.0.0
         with:
           fail-on: high
 ```
@@ -151,7 +151,7 @@ Severity values must be one of `critical`, `high`, `medium`, or `low`.
 Always pin the warden action to a specific commit SHA:
 
 ```yaml
-- uses: projectwarden/warden@a3c26c3f1897ddbe5c34cc3ce9ff4f14f84c83a8  # v2.0.0
+- uses: projectwarden/warden@e4f665f5171ef446d79cc5c268af6606d78aaf04  # v2.0.0
 ```
 
 Do not use `@main` or `@v1` (mutable tags). See [WRD-311](../rules/supply-chain.md#wrd-311-unpinned-third-party-actions).
@@ -186,7 +186,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
       - name: Run warden (gate)
-        uses: projectwarden/warden@a3c26c3f1897ddbe5c34cc3ce9ff4f14f84c83a8  # v2.0.0
+        uses: projectwarden/warden@e4f665f5171ef446d79cc5c268af6606d78aaf04  # v2.0.0
         with:
           path: .
           fail-on: high

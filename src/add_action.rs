@@ -41,7 +41,7 @@ pub const CHECKOUT_VERSION: &str = "v6.0.2";
 /// note as above. The release process must update this when a new warden
 /// version ships. The SHA below is updated in the follow-up pin commit
 /// after the v2.0.0 tag is cut.
-pub const WARDEN_ACTION_SHA: &str = "a3c26c3f1897ddbe5c34cc3ce9ff4f14f84c83a8";
+pub const WARDEN_ACTION_SHA: &str = "e4f665f5171ef446d79cc5c268af6606d78aaf04";
 pub const WARDEN_ACTION_VERSION: &str = "v2.0.0";
 
 /// Result of an add-action PR flow, mirrors the `fix --pr --format json`

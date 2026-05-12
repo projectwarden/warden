@@ -12,7 +12,7 @@ Second major release. Fewer false positives on step-output reads, inline `# ward
 
 ```sh
 # GitHub Action: bump the pin (SHA follow-up commit recommended)
-- uses: projectwarden/warden@a3c26c3f1897ddbe5c34cc3ce9ff4f14f84c83a8  # v2.0.0
+- uses: projectwarden/warden@e4f665f5171ef446d79cc5c268af6606d78aaf04  # v2.0.0
 
 # Docker
 docker pull ghcr.io/projectwarden/warden:2

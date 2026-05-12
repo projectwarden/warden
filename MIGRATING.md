@@ -63,7 +63,7 @@ If you used the v1 SHA pin:
 Replace with v2 (and re-pin to the new SHA after the v2.0.0 tag is published):
 
 ```yaml
-- uses: projectwarden/warden@a3c26c3f1897ddbe5c34cc3ce9ff4f14f84c83a8  # v2.0.0
+- uses: projectwarden/warden@e4f665f5171ef446d79cc5c268af6606d78aaf04  # v2.0.0
 ```
 
 The `with:` inputs (`path`, `fail-on`, `format`) are unchanged.
