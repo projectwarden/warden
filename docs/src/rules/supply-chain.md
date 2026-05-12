@@ -63,114 +63,7 @@ jobs:
 
 ---
 
-## WRD-320: Unpinned Actions
-
-**Severity:** Medium (promoted to High for third-party actions)
-
-**What it detects:** Actions referenced by mutable tags (e.g., `@v1`, `@v2.3`) rather than a full-length commit SHA. Tag contents can change without notice. Third-party actions are promoted to high severity; GitHub-owned actions (`actions/*`, `github/*`) remain medium.
-
-**Vulnerable:**
-
-```yaml
-- uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
-- uses: some-org/some-action@v2
-```
-
-**Remediation:** Pin every action to a specific commit SHA. Use a comment to document the version.
-
-```yaml
-- uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
-- uses: some-org/some-action@a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2  # v2.1.0
-```
-
----
-
-## WRD-321: Archived Action Reference
-
-**Severity:** Medium
-
-**What it detects:** References to GitHub Actions from known archived or deprecated repositories (e.g., `actions/create-release`, `actions-rs/toolchain`, `actions-rs/cargo`). Archived actions no longer receive security patches.
-
-**Vulnerable:**
-
-```yaml
-- uses: actions-rs/toolchain@v1
-```
-
-**Remediation:** Replace with an actively maintained alternative. Check the repository README for migration guidance.
-
----
-
-## WRD-322: Stale Action SHA Pin
-
-**Severity:** Medium
-
-**What it detects:** Actions pinned to a SHA without a version comment (e.g., `# v4.1.0`). Without a comment, it is difficult to tell which release the SHA corresponds to or whether the pin is outdated.
-
-**Vulnerable:**
-
-```yaml
-- uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-```
-
-**Remediation:** Add a version comment after the SHA pin for auditability and easier Dependabot/Renovate reviews.
-
-```yaml
-- uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
-```
-
----
-
-## WRD-323: Ref Version Mismatch
-
-**Severity:** Medium
-
-**What it detects:** Actions where the tag ref disagrees with the inline version comment. For example, `@v3 # v4` indicates a copy-paste error or partially completed version bump.
-
-**Vulnerable:**
-
-```yaml
-- uses: actions/checkout@v3  # v4.0.0
-```
-
-**Remediation:** Update the comment to match the actual ref, or update the ref to match the intended version.
-
----
-
-## WRD-324: Ref Confusion
-
-**Severity:** Medium
-
-**What it detects:** Actions pinned to branch names (`main`, `master`, `develop`, `dev`, `trunk`, `HEAD`) that are mutable and change with every commit. Builds using branch refs are non-reproducible and vulnerable to supply chain attacks.
-
-**Vulnerable:**
-
-```yaml
-- uses: some-org/some-action@main
-```
-
-**Remediation:** Pin to a full commit SHA or version tag. Use Dependabot or Renovate to keep pins current.
-
----
-
-## WRD-325: Runtime Binary Fetch
-
-**Severity:** Medium
-
-**What it detects:** Actions known to download external binaries at runtime (security scanners like Trivy, Snyk, Bearer, Semgrep, and language setup actions). Even if the action reference is SHA-pinned, the downloaded binary is not verified against the pin. A compromised upstream release can execute malicious code.
-
-**Vulnerable:**
-
-```yaml
-- uses: aquasecurity/trivy-action@a1b2c3d4...
-- uses: actions/setup-node@a1b2c3d4...
-```
-
-**Remediation:** Consider using container-based alternatives or verifying downloaded binaries against known checksums. For setup actions, specify a version input so the setup is intentional.
-
----
-
-## WRD-326: Forbidden Action Uses
+## WRD-313: Denylisted Action Reference
 
 **Severity:** High (some entries are Medium, see below)
 
@@ -192,9 +85,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
-      - uses: tj-actions/changed-files@v44                                 # WRD-326
-      - uses: reviewdog/action-setup@v1                                    # WRD-326
-      - uses: actions/checkout@v1                                          # WRD-326
+      - uses: tj-actions/changed-files@v44                                 # WRD-313
+      - uses: reviewdog/action-setup@v1                                    # WRD-313
+      - uses: actions/checkout@v1                                          # WRD-313
 ```
 
 **Remediation:** Pin to a known-good commit SHA after the fix, upgrade to a maintained successor (e.g. `actions/checkout@v4` or later for the EOL entries), or migrate to an alternative action. Re-running `warden scan` after the bump verifies the denylist match has cleared.
@@ -206,7 +99,7 @@ jobs:
 
 ---
 
-## WRD-327: Composite Action Internal Unpinned References
+## WRD-314: Transitive Action Pin Bypass
 
 **Severity:** High
 
@@ -235,3 +128,130 @@ runs:
 ```
 
 **Remediation:** Either fork `myorg/myaction`, pin all of its internal actions to SHAs, and use your fork, or switch to an alternative action whose `action.yml` only references SHA-pinned dependencies. Upstream maintainers can address this by pinning all internal `uses:` references in their `action.yml`.
+
+---
+
+## WRD-311: Unpinned Third-Party Actions
+
+**Severity:** Medium (promoted to High for third-party actions)
+
+**What it detects:** Actions referenced by mutable tags (e.g., `@v1`, `@v2.3`) rather than a full-length commit SHA. Tag contents can change without notice. Third-party actions are promoted to high severity; GitHub-owned actions (`actions/*`, `github/*`) remain medium.
+
+**Vulnerable:**
+
+```yaml
+- uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+- uses: some-org/some-action@v2
+```
+
+**Remediation:** Pin every action to a specific commit SHA. Use a comment to document the version.
+
+```yaml
+- uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+- uses: some-org/some-action@a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2  # v2.1.0
+```
+
+---
+
+## WRD-324: Branch-Ref Action Pin
+
+**Severity:** Medium
+
+**What it detects:** Actions pinned to branch names (`main`, `master`, `develop`, `dev`, `trunk`, `HEAD`) that are mutable and change with every commit. Builds using branch refs are non-reproducible and vulnerable to supply chain attacks.
+
+**Vulnerable:**
+
+```yaml
+- uses: some-org/some-action@main
+```
+
+**Remediation:** Pin to a full commit SHA or version tag. Use Dependabot or Renovate to keep pins current.
+
+---
+
+## WRD-345: Runtime Binary Fetch
+
+**Severity:** Info
+
+**What it detects:** Actions known to download external binaries at runtime (security scanners like Trivy, Snyk, Bearer, Semgrep, and language setup actions). Even if the action reference is SHA-pinned, the downloaded binary is not verified against the pin. A compromised upstream release can execute malicious code.
+
+**Why Info (v2.0.0):** The scanner cannot statically distinguish a legitimate setup action (`actions/setup-go`, `actions/setup-python`) from a compromised one. Every real-world workflow uses these. Flagging them as Medium/High generated noise without surfacing actual exploits. The rule is kept as an inventory of "which actions in your workflow fetch binaries at runtime" so a reader can audit them out-of-band; a future revision will split this into an allowlist (first-party setup actions) plus a suspicious-behavior detector (curl-pipe-bash in setup).
+
+**Vulnerable pattern (inventory only):**
+
+```yaml
+- uses: aquasecurity/trivy-action@a1b2c3d4...
+- uses: actions/setup-node@a1b2c3d4...
+```
+
+**Remediation:** For security-critical workflows, consider container-based alternatives (pin a digest on an image) or verify downloaded binaries against known checksums. For setup actions from first-party sources (actions/*), the risk is small in practice but non-zero; treat this finding as a hygiene reminder.
+
+---
+
+## WRD-331: Archived Action Reference
+
+**Severity:** Low
+
+**What it detects:** References to GitHub Actions from known archived or deprecated repositories (e.g., `actions/create-release`, `actions-rs/toolchain`, `actions-rs/cargo`). Archived actions no longer receive security patches.
+
+**Vulnerable:**
+
+```yaml
+- uses: actions-rs/toolchain@v1
+```
+
+**Remediation:** Replace with an actively maintained alternative. Check the repository README for migration guidance.
+
+---
+
+## WRD-332: SHA Pin Missing Version Comment
+
+**Severity:** Low
+
+**What it detects:** Actions pinned to a SHA without a version comment (e.g., `# v4.1.0`). Without a comment, it is difficult to tell which release the SHA corresponds to or whether the pin is outdated.
+
+**Vulnerable:**
+
+```yaml
+- uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+```
+
+**Remediation:** Add a version comment after the SHA pin for auditability and easier Dependabot/Renovate reviews.
+
+```yaml
+- uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+```
+
+---
+
+## WRD-333: Ref Version Mismatch
+
+**Severity:** Low
+
+**What it detects:** Actions where the tag ref disagrees with the inline version comment. For example, `@v3 # v4` indicates a copy-paste error or partially completed version bump.
+
+**Vulnerable:**
+
+```yaml
+- uses: actions/checkout@v3  # v4.0.0
+```
+
+**Remediation:** Update the comment to match the actual ref, or update the ref to match the intended version.
+
+---
+
+## WRD-335: Unverified Action Creator
+
+**Severity:** Low
+
+**What it detects:** A `uses:` step references an action whose owner is not on warden's curated allowlist of well-known-safe creators (GitHub-first-party, major cloud vendors, common language toolchains, vetted OSS security/ops tooling). Not evidence of malice, just a signal worth checking.
+
+Only one finding is emitted per unique creator per workflow so a repo that uses five actions from the same unverified org doesn't produce five copies of the same finding.
+
+**Vulnerable:**
+
+```yaml
+- uses: some-small-org/random-action@v1
+```
+
+**Remediation:** Cross-check the creator's identity and history, SHA-pin the action, and if you trust the creator, add them to your team's own allowlist (either by suppressing via `# warden: ignore[WRD-335]` inline or by configuring `[severity_overrides]` in `.warden.toml`). See `src/rules/wrd335.rs` for the full allowlist.

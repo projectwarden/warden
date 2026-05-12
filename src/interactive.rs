@@ -17,6 +17,7 @@ use colored::Colorize;
 use dialoguer::theme::ColorfulTheme;
 use dialoguer::{Confirm, Input, Select};
 
+use wardenscan::add_action;
 use wardenscan::audit;
 use wardenscan::fix;
 use wardenscan::output;
@@ -41,6 +42,7 @@ enum MenuChoice {
     ScanRemote,
     ScanLocal,
     Fix,
+    AddAction,
     Upstream,
     Rules,
     Exit,
@@ -52,6 +54,9 @@ impl MenuChoice {
             MenuChoice::ScanRemote => "Scan a GitHub repository          (e.g. vercel/next.js)",
             MenuChoice::ScanLocal => "Scan a local project / directory  (.github/workflows/)",
             MenuChoice::Fix => "Auto-fix workflow file(s)         (plan + apply)",
+            MenuChoice::AddAction => {
+                "Add warden to a repository        (.github/workflows/warden.yml)"
+            }
             MenuChoice::Upstream => {
                 "Scan upstream of your dependencies     (scan your dependencies' upstream CI/CD)"
             }
@@ -65,6 +70,7 @@ impl MenuChoice {
             MenuChoice::ScanRemote,
             MenuChoice::ScanLocal,
             MenuChoice::Fix,
+            MenuChoice::AddAction,
             MenuChoice::Upstream,
             MenuChoice::Rules,
             MenuChoice::Exit,
@@ -119,6 +125,7 @@ pub fn run() -> Result<()> {
             MenuChoice::ScanRemote => flow_scan(&theme, ScanKind::Remote),
             MenuChoice::ScanLocal => flow_scan(&theme, ScanKind::Local),
             MenuChoice::Fix => flow_fix(&theme),
+            MenuChoice::AddAction => flow_add_action(&theme),
             MenuChoice::Upstream => flow_upstream(&theme),
             MenuChoice::Rules => flow_rules(),
             MenuChoice::Exit => {
@@ -382,18 +389,89 @@ fn flow_upstream(theme: &ColorfulTheme) -> Result<()> {
     Ok(())
 }
 
-fn flow_rules() -> Result<()> {
-    let mut all = rules::all_rules();
-    all.sort_by(|a, b| a.id().cmp(b.id()));
+/// Add the warden GitHub Action to a local repo. Interactive v1 only handles
+/// the local-write path; the PR flow stays CLI-flag-only for now (the
+/// dashboard exposes it via /api/add-action-pr).
+fn flow_add_action(theme: &ColorfulTheme) -> Result<()> {
+    let path: String = Input::with_theme(theme)
+        .with_prompt("Repo root (where .github/workflows/warden.yml will be created)")
+        .default(".".to_string())
+        .show_default(true)
+        .interact_text()
+        .context("input cancelled")?;
 
-    println!("\n{} detection rules available:\n", all.len());
+    let fail_on_choices = ["critical", "high", "medium", "low", "none"];
+    let fail_on_idx = Select::with_theme(theme)
+        .with_prompt("Fail-on threshold for the generated workflow")
+        .items(fail_on_choices)
+        .default(1) // "high"
+        .interact_opt()
+        .context("selection cancelled")?
+        .unwrap_or(1);
+    let fail_on = fail_on_choices[fail_on_idx];
+
+    let yaml = add_action::generate_workflow_yaml(fail_on)?;
+
+    let preview = Confirm::with_theme(theme)
+        .with_prompt("Show the workflow YAML before writing?")
+        .default(false)
+        .interact_opt()
+        .context("prompt cancelled")?
+        .unwrap_or(false);
+
+    if preview {
+        println!();
+        println!("{}", yaml.dimmed());
+        println!();
+        let go = Confirm::with_theme(theme)
+            .with_prompt("Write this to .github/workflows/warden.yml?")
+            .default(true)
+            .interact_opt()
+            .context("prompt cancelled")?
+            .unwrap_or(false);
+        if !go {
+            println!("{}", "Aborted. Nothing was written.".yellow());
+            return Ok(());
+        }
+    }
+
+    let repo_root = std::path::PathBuf::from(&path);
+    let written = add_action::write_workflow_file(&repo_root, &yaml)?;
+    println!();
+    println!("{} {}", "Wrote".green().bold(), written.display());
+    println!();
+    println!("Next steps:");
+    println!("  1. Review the file:  cat {}", written.display());
+    println!(
+        "  2. Commit:           git add {} && git commit -m 'ci: add warden security scanner'",
+        written.display()
+    );
+    println!("  3. Push and open a PR for review.");
+    Ok(())
+}
+
+fn flow_rules() -> Result<()> {
+    let mut rows: Vec<(String, String, String)> = rules::all_rules()
+        .iter()
+        .map(|r| {
+            let m = r.meta();
+            (
+                m.id.to_string(),
+                m.default_severity.as_str().to_string(),
+                m.name.to_string(),
+            )
+        })
+        .collect();
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+
+    println!("\n{} detection rules available:\n", rows.len());
     println!("  {:<10} {:<22} NAME", "ID", "SEVERITY");
     println!("  {}", "-".repeat(72));
 
     let cap = 30usize;
-    let total = all.len();
+    let total = rows.len();
 
-    for (idx, rule) in all.iter().enumerate() {
+    for (idx, (id, sev, name)) in rows.iter().enumerate() {
         if idx == cap && total > cap {
             // Pause for paging.
             println!(
@@ -411,8 +489,8 @@ fn flow_rules() -> Result<()> {
             }
         }
 
-        let severity_str = format_severity_label(rule.severity());
-        println!("  {:<10} {:<32} {}", rule.id(), severity_str, rule.name());
+        let severity_str = format_severity_label(sev);
+        println!("  {id:<10} {severity_str:<32} {name}");
     }
     println!();
 

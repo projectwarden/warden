@@ -6,6 +6,7 @@ use serde::Deserialize;
 use super::Workflow;
 
 const GITHUB_API: &str = "https://api.github.com";
+const GITHUB_GRAPHQL: &str = "https://api.github.com/graphql";
 
 #[derive(Deserialize)]
 struct ContentEntry {
@@ -100,33 +101,128 @@ fn fetch_file_content(client: &Client, download_url: &str) -> Result<String> {
     resp.text().context("Failed to read response body")
 }
 
-/// Load all workflow files from a GitHub repository.
-pub fn load_github(owner: &str, repo: &str, token: Option<&str>) -> Result<Vec<Workflow>> {
-    let client = build_client(token)?;
-    let files = list_workflow_files(&client, owner, repo)?;
+/// Fetch all workflow files via a single GitHub GraphQL query.
+///
+/// The query asks for the `.github/workflows` tree with inline blob text,
+/// so both the file listing and every file's content arrive in one round trip.
+/// This requires a valid token (GraphQL has no anonymous access).
+fn load_github_graphql(client: &Client, owner: &str, repo: &str) -> Result<Vec<Workflow>> {
+    let graphql_query = r#"query($owner: String!, $name: String!) { repository(owner: $owner, name: $name) { object(expression: "HEAD:.github/workflows") { ... on Tree { entries { name object { ... on Blob { text } } } } } } }"#;
+    let body = serde_json::json!({
+        "query": graphql_query,
+        "variables": { "owner": owner, "name": repo }
+    });
+
+    let resp = client
+        .post(GITHUB_GRAPHQL)
+        .json(&body)
+        .send()
+        .context("Failed to reach GitHub GraphQL API")?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        bail!("GitHub GraphQL API returned status {status}");
+    }
+
+    let body: serde_json::Value = resp.json().context("Failed to parse GraphQL response")?;
+
+    if let Some(errors) = body.get("errors") {
+        bail!("GraphQL errors: {errors}");
+    }
+
+    let tree = body
+        .pointer("/data/repository/object/entries")
+        .and_then(|v| v.as_array())
+        .context("No .github/workflows directory found (GraphQL returned no tree entries)")?;
 
     let mut workflows = Vec::new();
+    for entry in tree {
+        let name = entry
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
 
-    for entry in &files {
-        let url = match &entry.download_url {
-            Some(u) => u.clone(),
+        if !name.ends_with(".yml") && !name.ends_with(".yaml") {
+            continue;
+        }
+
+        let content = match entry.pointer("/object/text").and_then(|v| v.as_str()) {
+            Some(t) => t.to_string(),
             None => continue,
         };
 
-        let content = match fetch_file_content(&client, &url) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("Warning: could not fetch {}: {}", entry.path, e);
-                continue;
-            }
-        };
-
+        let path = format!(".github/workflows/{name}");
         let parsed: serde_yaml::Value = serde_yaml::from_str(&content)
-            .with_context(|| format!("Failed to parse YAML in {}", entry.path))?;
+            .with_context(|| format!("Failed to parse YAML in {}", path))?;
 
         workflows.push(Workflow {
-            path: entry.path.clone(),
-            content: content.clone(),
+            path,
+            content,
+            parsed,
+        });
+    }
+
+    Ok(workflows)
+}
+
+/// Load all workflow files from a GitHub repository.
+///
+/// When a token is available, uses a single GraphQL query that fetches
+/// both the file listing and all file contents in one round trip. Falls
+/// back to the N+1 REST approach if no token is provided (GraphQL
+/// requires authentication) or if the GraphQL call fails.
+pub fn load_github(owner: &str, repo: &str, token: Option<&str>) -> Result<Vec<Workflow>> {
+    let has_token = token.is_some_and(|t| !t.is_empty());
+    let client = build_client(token)?;
+
+    if has_token {
+        match load_github_graphql(&client, owner, repo) {
+            Ok(workflows) => return Ok(workflows),
+            Err(e) => {
+                eprintln!("Warning: GraphQL fetch failed, falling back to REST: {e}");
+            }
+        }
+    }
+
+    load_github_rest(&client, owner, repo)
+}
+
+/// REST fallback: 1 call to list files, then N parallel calls to fetch content.
+fn load_github_rest(client: &Client, owner: &str, repo: &str) -> Result<Vec<Workflow>> {
+    let files = list_workflow_files(client, owner, repo)?;
+
+    let fetched: Vec<Option<(String, String)>> = std::thread::scope(|s| {
+        let client_ref = client;
+        let handles: Vec<_> = files
+            .iter()
+            .map(|entry| {
+                let path = entry.path.clone();
+                let url = entry.download_url.clone();
+                s.spawn(move || {
+                    let url = url?;
+                    match fetch_file_content(client_ref, &url) {
+                        Ok(content) => Some((path, content)),
+                        Err(e) => {
+                            eprintln!("Warning: could not fetch {}: {}", path, e);
+                            None
+                        }
+                    }
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap_or(None))
+            .collect()
+    });
+
+    let mut workflows = Vec::with_capacity(fetched.len());
+    for (path, content) in fetched.into_iter().flatten() {
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&content)
+            .with_context(|| format!("Failed to parse YAML in {}", path))?;
+        workflows.push(Workflow {
+            path,
+            content,
             parsed,
         });
     }

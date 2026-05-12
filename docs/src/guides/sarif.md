@@ -26,7 +26,7 @@ docker run --rm -v "$PWD:/repo" ghcr.io/projectwarden/warden:latest \
 ### GitHub Action
 
 ```yaml
-- uses: projectwarden/warden@v1
+- uses: projectwarden/warden@a3c26c3f1897ddbe5c34cc3ce9ff4f14f84c83a8  # v2.0.0
   with:
     format: sarif
     output-file: results.sarif

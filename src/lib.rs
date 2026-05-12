@@ -1,6 +1,13 @@
+pub mod add_action;
 pub mod audit;
 pub mod config;
+pub mod expression;
 pub mod fix;
+pub mod ignores;
+pub mod models;
 pub mod output;
 pub mod rules;
 pub mod scanner;
+pub mod shell;
+pub mod taint;
+pub mod yamlpath;

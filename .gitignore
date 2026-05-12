@@ -23,3 +23,8 @@ docs/book/
 .local/
 CLAUDE.md
 RELEASE.md
+
+# Per-developer Claude Code tooling (skills, settings, task scratch).
+# Skills here are local workflow helpers; if one is worth sharing with the
+# team, check it in explicitly with `git add -f .claude/skills/<name>.md`.
+.claude/

@@ -51,7 +51,7 @@ pub fn console_capped(findings: &[Finding], cap: Option<usize>) {
     println!();
 
     // Top rules by count. Helps users see when one systemic issue
-    // (e.g. 50x WRD-320 unpinned) is dominating the noise vs when
+    // (e.g. 50x WRD-311 unpinned) is dominating the noise vs when
     // they have a wide spread of distinct findings.
     if findings.len() >= 5 {
         let mut by_rule: std::collections::HashMap<String, usize> =
@@ -102,26 +102,64 @@ pub fn console_capped(findings: &[Finding], cap: Option<usize>) {
 
     // Table header
     println!(
-        "  {:<12} {:<14} {:<44} LOCATION",
+        "  {:<12} {:<14} {:<44} LOCATIONS",
         "SEVERITY", "RULE", "TITLE"
     );
     println!("  {}", "-".repeat(90));
 
-    for f in table_slice {
-        let severity_str = format_severity(&f.severity);
-        let location = if f.line > 0 {
-            format!("{}:{}", f.file, f.line)
+    // Group consecutive findings that share (rule_id, file, title). The
+    // input is already sorted by (severity, file, line), so same-rule /
+    // same-file entries land back-to-back; we collapse them into one row
+    // with a comma-separated line list. Keeps big WRD-840 / WRD-440
+    // listings readable.
+    let mut i = 0;
+    while i < table_slice.len() {
+        let head = table_slice[i];
+        let mut j = i + 1;
+        let mut lines: Vec<usize> = vec![head.line];
+        while j < table_slice.len() {
+            let peek = table_slice[j];
+            if peek.rule_id == head.rule_id
+                && peek.file == head.file
+                && peek.title == head.title
+                && peek.severity == head.severity
+            {
+                lines.push(peek.line);
+                j += 1;
+            } else {
+                break;
+            }
+        }
+
+        let severity_str = format_severity(&head.severity);
+        let location = if lines.iter().all(|&l| l > 0) {
+            let joined = lines
+                .iter()
+                .map(|l| l.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{}:{}", head.file, joined)
         } else {
-            f.file.clone()
+            head.file.clone()
         };
+
+        let count_tag = if lines.len() > 1 {
+            format!(" (×{})", lines.len())
+        } else {
+            String::new()
+        };
+        let title_with_count = format!(
+            "{}{}",
+            truncate(&head.title, 43 - count_tag.len()),
+            count_tag
+        );
 
         println!(
             "  {:<22} {:<14} {:<44} {}",
-            severity_str,
-            f.rule_id,
-            truncate(&f.title, 43),
-            location,
+            severity_str, head.rule_id, title_with_count, location,
         );
+
+        i = j;
     }
 
     if hidden > 0 {

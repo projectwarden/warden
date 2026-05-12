@@ -121,11 +121,26 @@ jobs:
           (cd upload && sha256sum * > SHA256SUMS)
           ls -la upload
 
+      - name: Extract release notes for this tag from CHANGELOG.md
+        run: |
+          # Pull the section between "## v<TAG>" and the next "## v" header.
+          # If the section is empty, fall back to a one-line generic body.
+          awk -v ver="${GITHUB_REF_NAME}" '
+            $0 ~ "^## "ver { found=1; next }
+            found && /^## v/ { exit }
+            found { print }
+          ' CHANGELOG.md > release-notes.md
+          if [ ! -s release-notes.md ]; then
+            echo "warden ${GITHUB_REF_NAME}" > release-notes.md
+          fi
+          echo "--- release notes ---"
+          cat release-notes.md
+
       - name: Create GitHub release
         uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2.6.1
         with:
           files: upload/*
-          body_path: CHANGELOG.md
+          body_path: release-notes.md
           draft: false
           prerelease: false
           generate_release_notes: false
@@ -137,6 +152,7 @@ jobs:
     # Skip on any pre-release tag (rc, alpha, beta) so they don't burn a real
     # crates.io version. Only stable v1.0.0-style tags publish.
     if: ${{ !contains(github.ref_name, '-') }}
+    environment: crates-io
     permissions:
       contents: read
     steps:

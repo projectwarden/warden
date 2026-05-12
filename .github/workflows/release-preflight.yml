@@ -1,0 +1,131 @@
+name: Release preflight
+
+# Catch release-config breakage on the PR, not at tag-push time. Mirrors
+# the matrix from release.yml minus the upload + publish steps, so a
+# broken cross-compile or a regressed `cargo publish` config fails on
+# PR-touch of release-relevant files instead of after tagging v2.0.1.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'src/**'
+      - 'Dockerfile'
+      - 'action.yml'
+      - '.github/workflows/release.yml'
+      - '.github/workflows/release-preflight.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  publish-dry-run:
+    name: cargo publish --dry-run
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # stable
+        with:
+          toolchain: stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      # `--allow-dirty` is fine here because PR builds are checked out
+      # clean. The flag only matters if local changes exist, which never
+      # happens on a fresh runner.
+      - name: cargo publish --dry-run
+        run: cargo publish --dry-run --allow-dirty
+
+  cross-build:
+    # Build for every release target without uploading anything. A
+    # broken aarch64 linker or a missing Windows dep would otherwise
+    # only surface during `release.yml` after tagging.
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            cross-linker: aarch64-linux-gnu-gcc
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install cross linker (aarch64-linux)
+        if: matrix.cross-linker == 'aarch64-linux-gnu-gcc'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          mkdir -p .cargo
+          cat >> .cargo/config.toml <<'EOF'
+          [target.aarch64-unknown-linux-gnu]
+          linker = "aarch64-linux-gnu-gcc"
+          EOF
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+  changelog-has-tag-section:
+    # If Cargo.toml version is bumped in this PR, CHANGELOG.md must have
+    # a matching `## vX.Y.Z` heading so the release.yml extraction step
+    # has something to paste into the GitHub release body.
+    name: CHANGELOG entry exists for new version
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Compare version vs main
+        run: |
+          set -euo pipefail
+          cur=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          git fetch origin main:refs/remotes/origin/main
+          base=$(git show origin/main:Cargo.toml | grep -m1 '^version' | cut -d'"' -f2)
+          if [ "$cur" = "$base" ]; then
+            echo "Version unchanged ($cur), nothing to verify."
+            exit 0
+          fi
+          echo "Version bumped: $base -> $cur"
+          if ! grep -q "^## v${cur}\b" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md missing '## v${cur}' section for new release"
+            exit 1
+          fi
+          echo "CHANGELOG section for v${cur} found."

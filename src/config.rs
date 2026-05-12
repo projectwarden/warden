@@ -6,10 +6,10 @@
 //! Example:
 //!
 //! ```toml
-//! disabled_rules = ["WRD-710", "WRD-201"]
+//! disabled_rules = ["WRD-730", "WRD-201"]
 //!
 //! [severity_overrides]
-//! "WRD-322" = "low"
+//! "WRD-332" = "low"
 //! ```
 
 use std::collections::HashMap;
@@ -23,7 +23,7 @@ use crate::rules::Finding;
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct WardenConfig {
-    /// Rule IDs to suppress entirely (e.g. `["WRD-710"]`).
+    /// Rule IDs to suppress entirely (e.g. `["WRD-730"]`).
     pub disabled_rules: Vec<String>,
 
     /// Override the severity of a rule's findings. Values should be one of
@@ -32,18 +32,33 @@ pub struct WardenConfig {
 }
 
 impl WardenConfig {
-    /// Return true if this rule should be completely suppressed.
+    /// Return true if this rule should be completely suppressed. Both the
+    /// caller's `rule_id` and every entry in `disabled_rules` are
+    /// canonicalised through the v2.0.0 alias map, so a config that lists
+    /// a legacy ID (e.g. `"WRD-826"`) still suppresses the renumbered
+    /// rule (`"WRD-840"`).
     pub fn is_disabled(&self, rule_id: &str) -> bool {
-        self.disabled_rules.iter().any(|r| r == rule_id)
+        let canonical = crate::rules::aliases::canonicalize(rule_id);
+        self.disabled_rules
+            .iter()
+            .any(|r| crate::rules::aliases::canonicalize(r) == canonical)
     }
 
     /// Apply both severity overrides and disabled-rules filtering to a set of
-    /// findings, in place.
+    /// findings, in place. Severity-override keys are canonicalised the
+    /// same way `is_disabled` does, so a legacy ID in `.warden.toml`
+    /// still drives the override on the renumbered rule.
     pub fn apply(&self, findings: &mut Vec<Finding>) {
         findings.retain(|f| !self.is_disabled(&f.rule_id));
         if !self.severity_overrides.is_empty() {
             for f in findings.iter_mut() {
-                if let Some(new_sev) = self.severity_overrides.get(&f.rule_id) {
+                let canonical = crate::rules::aliases::canonicalize(&f.rule_id);
+                let new_sev = self
+                    .severity_overrides
+                    .iter()
+                    .find(|(k, _)| crate::rules::aliases::canonicalize(k) == canonical)
+                    .map(|(_, v)| v);
+                if let Some(new_sev) = new_sev {
                     f.severity = new_sev.to_lowercase();
                 }
             }
@@ -106,10 +121,10 @@ mod tests {
     #[test]
     fn disabled_rules_are_filtered() {
         let cfg = WardenConfig {
-            disabled_rules: vec!["WRD-710".to_string()],
+            disabled_rules: vec!["WRD-730".to_string()],
             ..Default::default()
         };
-        let mut findings = vec![finding("WRD-710", "high"), finding("WRD-101", "critical")];
+        let mut findings = vec![finding("WRD-730", "high"), finding("WRD-101", "critical")];
         cfg.apply(&mut findings);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].rule_id, "WRD-101");
@@ -129,6 +144,34 @@ mod tests {
     }
 
     #[test]
+    fn legacy_disabled_rule_id_suppresses_renumbered_rule() {
+        // .warden.toml from before v2.0.0 lists "WRD-826"; after the
+        // renumbering the same rule emits findings tagged "WRD-840".
+        // The alias layer should bridge the two.
+        let cfg = WardenConfig {
+            disabled_rules: vec!["WRD-826".to_string()],
+            ..Default::default()
+        };
+        let mut findings = vec![finding("WRD-840", "info"), finding("WRD-101", "critical")];
+        cfg.apply(&mut findings);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule_id, "WRD-101");
+    }
+
+    #[test]
+    fn legacy_severity_override_id_applies_to_renumbered_rule() {
+        let mut overrides = HashMap::new();
+        overrides.insert("WRD-822".to_string(), "low".to_string());
+        let cfg = WardenConfig {
+            severity_overrides: overrides,
+            ..Default::default()
+        };
+        let mut findings = vec![finding("WRD-815", "high")];
+        cfg.apply(&mut findings);
+        assert_eq!(findings[0].severity, "low");
+    }
+
+    #[test]
     fn load_from_reads_toml_and_walks_parents() {
         let tmp = std::env::temp_dir().join(format!("warden-cfg-test-{}", std::process::id()));
         let nested = tmp.join("a").join("b");
@@ -136,17 +179,17 @@ mod tests {
         fs::write(
             tmp.join(".warden.toml"),
             r#"
-disabled_rules = ["WRD-710"]
+disabled_rules = ["WRD-730"]
 
 [severity_overrides]
-"WRD-322" = "low"
+"WRD-332" = "low"
 "#,
         )
         .unwrap();
 
         let cfg = load_from(&nested).expect("config should be found");
-        assert!(cfg.is_disabled("WRD-710"));
-        assert_eq!(cfg.severity_overrides.get("WRD-322").unwrap(), "low");
+        assert!(cfg.is_disabled("WRD-730"));
+        assert_eq!(cfg.severity_overrides.get("WRD-332").unwrap(), "low");
 
         fs::remove_dir_all(&tmp).ok();
     }

@@ -2,6 +2,7 @@ use anyhow::{bail, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use colored::Colorize;
 
+use wardenscan::add_action;
 use wardenscan::audit;
 use wardenscan::fix;
 use wardenscan::output;
@@ -21,6 +22,7 @@ EXAMPLES:
     warden score aquasecurity/trivy  Compute a security score for a remote repo
     warden fix .                     Plan auto-fixes (no writes by default)
     warden fix . --apply             Apply auto-fixes to disk
+    warden add-action .              Add the warden GitHub Action to a repo
     warden upstream .                Scan your dependencies' upstream CI/CD workflows
     warden rules                     List every detection rule
 
@@ -110,6 +112,29 @@ const RULES_AFTER_HELP: &str = "\
 EXAMPLES:
     # Print every detection rule grouped by severity
     warden rules";
+
+const ADD_ACTION_AFTER_HELP: &str = "\
+EXAMPLES:
+    # Print the workflow YAML to stdout for manual copy/paste
+    warden add-action --print
+
+    # Write .github/workflows/warden.yml to the current repo
+    warden add-action
+
+    # Write to a different repo on disk
+    warden add-action ./path/to/other-repo
+
+    # Use a specific severity threshold
+    warden add-action --fail-on critical
+
+    # Open a PR adding the workflow to a remote repo (returns a compare URL by default)
+    GITHUB_TOKEN=ghp_... warden add-action --pr myorg/myrepo
+
+    # Same, but actually create the PR for you instead of just the compare URL
+    GITHUB_TOKEN=ghp_... warden add-action --pr myorg/myrepo --apply --no-prepare-only
+
+    # JSON output for the dashboard
+    warden add-action --pr myorg/myrepo --format json";
 
 #[derive(Subcommand)]
 enum Commands {
@@ -248,6 +273,62 @@ each one's workflows. Helps you spot supply-chain risk in the libraries you depe
         /// Dependency walk depth (1 = direct deps only, 2 = also deps-of-deps)
         #[arg(long, default_value_t = 1)]
         depth: u8,
+
+        /// GitHub personal access token (or set GITHUB_TOKEN env var)
+        #[arg(long, env = "GITHUB_TOKEN")]
+        github_token: Option<String>,
+    },
+
+    /// Add the warden GitHub Action to a repo
+    #[command(
+        long_about = "Generate a `.github/workflows/warden.yml` file that runs the warden \
+GitHub Action against the repo's own workflows. By default writes the file directly to \
+the local repo at PATH (errors if it already exists). Use `--print` for stdout-only, or \
+`--pr OWNER/REPO` to push a branch and return a compare URL. The PR flow uses the same \
+fork-and-branch machinery as `warden fix --pr`.",
+        after_help = ADD_ACTION_AFTER_HELP
+    )]
+    AddAction {
+        /// Local path to the repo root (where `.github/workflows/warden.yml` will be created)
+        ///
+        /// Examples: . | ./my-project
+        #[arg(default_value = ".")]
+        path: String,
+
+        /// Print the generated workflow YAML to stdout instead of writing it to disk
+        #[arg(long)]
+        print: bool,
+
+        /// Severity threshold the generated workflow uses for its CI gate
+        #[arg(long, default_value = "high")]
+        fail_on: FailLevel,
+
+        /// Open a pull request adding the workflow to `owner/repo` (forks if no write access)
+        #[arg(long, value_name = "OWNER/REPO")]
+        pr: Option<String>,
+
+        /// Branch name to create for the PR (default: `warden/add-action-<unix-ts>`)
+        #[arg(long)]
+        branch: Option<String>,
+
+        /// Apply changes for real. Without this, `--pr` runs in plan mode (no network calls).
+        /// Plain local writes (no `--pr`) ignore this flag and always write the file.
+        #[arg(long)]
+        apply: bool,
+
+        /// With `--pr`, push the branch but do NOT call POST /pulls; return a compare URL
+        /// that the user can click to review and submit the PR themselves. Default behavior.
+        #[arg(long, default_value_t = true)]
+        prepare_only: bool,
+
+        /// Skip `--prepare-only` and actually open the PR via the GitHub API.
+        /// Has no effect without `--pr` and `--apply`.
+        #[arg(long, default_value_t = false, conflicts_with = "prepare_only")]
+        no_prepare_only: bool,
+
+        /// Output format: console | json
+        #[arg(long, default_value = "console", value_enum)]
+        format: FixFormat,
 
         /// GitHub personal access token (or set GITHUB_TOKEN env var)
         #[arg(long, env = "GITHUB_TOKEN")]
@@ -431,7 +512,21 @@ fn run() -> Result<bool> {
                 // PR mode: compute fixes in memory, push a branch, open a PR.
                 let payload = fix::run_fix_json(&workflows, github_token.as_deref(), plan_only);
                 if payload.files.is_empty() {
-                    println!("No fixable issues found; skipping PR creation.");
+                    match format {
+                        FixFormat::Console => {
+                            println!("No fixable issues found; skipping PR creation.");
+                        }
+                        FixFormat::Json => {
+                            let out = serde_json::json!({
+                                "pr_url": null,
+                                "branch": null,
+                                "fixes_count": 0,
+                                "files_count": 0,
+                                "message": "No fixable issues found",
+                            });
+                            println!("{out}");
+                        }
+                    }
                     return Ok(false);
                 }
                 let (owner, repo) = match repo_slug.split_once('/') {
@@ -447,7 +542,18 @@ fn run() -> Result<bool> {
                     plan_only,
                     prepare_only,
                 )?;
-                println!("{url}");
+                match format {
+                    FixFormat::Console => println!("{url}"),
+                    FixFormat::Json => {
+                        let out = serde_json::json!({
+                            "pr_url": url,
+                            "branch": null,
+                            "fixes_count": payload.total_fixes,
+                            "files_count": payload.files.len(),
+                        });
+                        println!("{out}");
+                    }
+                }
                 return Ok(false);
             }
 
@@ -502,30 +608,132 @@ fn run() -> Result<bool> {
             Ok(best <= threshold)
         }
 
+        Commands::AddAction {
+            path,
+            print,
+            fail_on,
+            pr,
+            branch,
+            apply,
+            prepare_only,
+            no_prepare_only,
+            format,
+            github_token,
+        } => {
+            // Resolve fail_on -> the lowercase string the YAML generator expects.
+            let fail_on_str = match fail_on {
+                FailLevel::Critical => "critical",
+                FailLevel::High => "high",
+                FailLevel::Medium => "medium",
+                FailLevel::Low => "low",
+                FailLevel::None => "none",
+            };
+
+            let yaml = add_action::generate_workflow_yaml(fail_on_str)?;
+
+            // PR mode: push a branch on owner/repo (or its fork) and return a URL.
+            if let Some(repo_slug) = pr {
+                let (owner, repo_name) = match repo_slug.split_once('/') {
+                    Some((o, r)) if !o.is_empty() && !r.is_empty() => (o, r),
+                    _ => bail!("--pr expects OWNER/REPO, got: {repo_slug}"),
+                };
+
+                let plan_only = !apply;
+                let prepare = if no_prepare_only { false } else { prepare_only };
+
+                let result = add_action::open_add_action_pr(
+                    owner,
+                    repo_name,
+                    branch.as_deref(),
+                    &yaml,
+                    fail_on_str,
+                    github_token.as_deref(),
+                    plan_only,
+                    prepare,
+                )?;
+
+                match format {
+                    FixFormat::Console => {
+                        println!("{}", result.pr_url);
+                    }
+                    FixFormat::Json => {
+                        let out = serde_json::json!({
+                            "pr_url": result.pr_url,
+                            "branch": result.branch,
+                            "workflow_path": result.workflow_path,
+                            "fixes_count": 1,
+                        });
+                        println!("{out}");
+                    }
+                }
+                return Ok(false);
+            }
+
+            // Print mode: stdout only, no writes.
+            if print {
+                print!("{yaml}");
+                return Ok(false);
+            }
+
+            // Local write mode (default): write to <path>/.github/workflows/warden.yml.
+            let repo_root = std::path::PathBuf::from(&path);
+            let written = add_action::write_workflow_file(&repo_root, &yaml)?;
+
+            match format {
+                FixFormat::Console => {
+                    println!("{} {}", "Wrote".green().bold(), written.display());
+                    println!();
+                    println!("Next steps:");
+                    println!("  1. Review the file:  cat {}", written.display());
+                    println!("  2. Commit it:        git add {} && git commit -m 'ci: add warden security scanner'", written.display());
+                    println!("  3. Push and open a PR for review.");
+                }
+                FixFormat::Json => {
+                    let out = serde_json::json!({
+                        "workflow_path": written.display().to_string(),
+                        "fail_on": fail_on_str,
+                        "written": true,
+                    });
+                    println!("{out}");
+                }
+            }
+            Ok(false)
+        }
+
         Commands::Rules => {
-            let mut all = rules::all_rules();
+            let all = rules::all_rules();
 
             if all.is_empty() {
                 println!("No rules registered.");
                 return Ok(false);
             }
 
-            // Sort by rule ID so categories are grouped
-            all.sort_by(|a, b| a.id().cmp(b.id()));
+            let mut combined: Vec<(String, String, String)> = all
+                .iter()
+                .map(|r| {
+                    let m = r.meta();
+                    (
+                        m.id.to_string(),
+                        m.default_severity.as_str().to_string(),
+                        m.name.to_string(),
+                    )
+                })
+                .collect();
+            combined.sort_by(|a, b| a.0.cmp(&b.0));
 
-            println!("\n{} detection rules available:\n", all.len());
+            println!("\n{} detection rules available:\n", combined.len());
             println!("  {:<10} {:<12} NAME", "ID", "SEVERITY");
             println!("  {}", "-".repeat(60));
 
-            for rule in &all {
-                let severity_str = match rule.severity().to_lowercase().as_str() {
+            for (id, sev, name) in &combined {
+                let severity_str = match sev.to_lowercase().as_str() {
                     "critical" => "CRITICAL".red().bold().to_string(),
                     "high" => "HIGH".red().to_string(),
                     "medium" => "MEDIUM".yellow().to_string(),
                     "low" => "LOW".blue().to_string(),
                     other => other.to_uppercase(),
                 };
-                println!("  {:<10} {:<22} {}", rule.id(), severity_str, rule.name());
+                println!("  {id:<10} {severity_str:<22} {name}");
             }
             println!();
 

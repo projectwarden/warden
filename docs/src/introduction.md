@@ -40,6 +40,15 @@ Severity is encoded in the tens/units digit of the rule number. See [Rules Overv
 - Crate name: `wardenscan`
 - Language: Rust
 - Total rules: 53
+- Current version: 2.0.0
+
+## What's new in v2
+
+- Typed workflow model and byte-exact span tracking, so findings carry real source locations and the auto-fixer can rewrite the offending bytes without regenerating the whole document.
+- Real `${{ ... }}` expression parser plus tree-sitter shell analysis for `run:` blocks, replacing v1's regex-based heuristics.
+- **Cross-step taint propagation**: warden tracks every write to `$GITHUB_OUTPUT` and classifies the upstream source (tainted, safe, secret, literal, unknown). Downstream `${{ steps.X.outputs.Y }}` reads are rated against the upstream provenance, which eliminates v1's false-positive flood on workflows that build a digest from `$GITHUB_SHA` and read it back later.
+- **Inline ignore directives**: `# warden: ignore[WRD-XXX]` suppresses a rule at one location without editing `.warden.toml`. Quote-aware so `run: echo "# warden: ignore[..]"` inside a string is not treated as a directive.
+- Severity recalibration so HIGH means actionable. See [MIGRATING.md](https://github.com/projectwarden/warden/blob/main/MIGRATING.md) for the full upgrade story.
 
 ## Source
 

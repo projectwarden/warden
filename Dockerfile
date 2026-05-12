@@ -3,7 +3,11 @@
 # which needs Rust 1.85 or newer.
 FROM rust:1-slim AS builder
 WORKDIR /app
-# rustls-tls is used (no OpenSSL dep). No libssl-dev / pkg-config required.
+# rustls-tls is used (no OpenSSL dep). build-essential is required because
+# tree-sitter and tree-sitter-bash compile a small C parser at build time.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential \
+    && rm -rf /var/lib/apt/lists/*
 COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
 RUN cargo build --release

@@ -65,12 +65,23 @@ git checkout --orphan public
 
 # Stage everything from main, then strip private paths.
 git checkout "$MAIN_SHA" -- .
+# Files and dirs that must never reach projectwarden/warden. If you add a
+# new one, bump the sanity-check regex below too.
 git rm -rf --quiet --ignore-unmatch \
   web/ \
   .local/ \
   CLAUDE.md \
   RELEASE.md \
-  USER_TODO.md
+  USER_TODO.md \
+  SECURITY-AUDIT-WEB.md \
+  docs/internal/ \
+  .github/workflows/deploy-web.yml
+
+# Clean any on-disk remnants that git rm missed (e.g. files only in
+# nested .gitignore scopes like web/.clerk/). Without this, git add -A
+# below would re-add them. git clean -fdx scours untracked files too.
+git clean -fdx -- web/ .local/ >/dev/null 2>&1 || true
+rm -rf web/ .local/ 2>/dev/null || true
 
 # Stage what's left and commit it as the single release commit.
 git add -A
@@ -78,7 +89,7 @@ git -c user.email="warden@projectwarden.dev" -c user.name="warden" \
   commit --quiet -m "$COMMIT_MSG"
 
 # Sanity check: make absolutely sure no private paths slipped in.
-LEAKED="$(git ls-tree -r HEAD --name-only | grep -E '^(web/|\.local/|CLAUDE\.md|RELEASE\.md|USER_TODO\.md)' || true)"
+LEAKED="$(git ls-tree -r HEAD --name-only | grep -E '^(web/|\.local/|CLAUDE\.md|RELEASE\.md|USER_TODO\.md|SECURITY-AUDIT-WEB\.md|docs/internal/|\.github/workflows/deploy-web\.yml)' || true)"
 if [ -n "$LEAKED" ]; then
   echo "error: public branch contains private paths after strip:" >&2
   echo "$LEAKED" >&2
@@ -102,5 +113,6 @@ echo ""
 echo "Next steps:"
 echo "  1. Watch CI on https://github.com/projectwarden/warden/actions"
 echo "  2. Add CARGO_REGISTRY_TOKEN secret in repo Settings -> Secrets -> Actions"
-echo "  3. git tag v$(grep -m1 '^version = ' Cargo.toml | sed 's/^version = \"\\(.*\\)\"$/\\1/') public"
-echo "  4. git push public v$(grep -m1 '^version = ' Cargo.toml | sed 's/^version = \"\\(.*\\)\"$/\\1/')"
+PUBLISHED_VERSION=$(grep -m1 '^version = ' Cargo.toml | sed 's/^version = "\(.*\)"$/\1/')
+echo "  3. git tag v$PUBLISHED_VERSION public"
+echo "  4. git push public v$PUBLISHED_VERSION"

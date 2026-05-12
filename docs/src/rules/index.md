@@ -8,14 +8,14 @@ The hundreds digit indicates the category:
 
 | Prefix | Category | Rules |
 |--------|----------|-------|
-| 1xx | [Injection](./injection.md) | WRD-101, WRD-110 to WRD-113, WRD-120 |
+| 1xx | [Injection](./injection.md) | WRD-101, WRD-110 to WRD-113, WRD-130 |
 | 2xx | [Triggers](./triggers.md) | WRD-201 to WRD-203 |
-| 3xx | [Supply Chain](./supply-chain.md) | WRD-301, WRD-302, WRD-310, WRD-320 to WRD-327 |
-| 4xx | [Permissions](./permissions.md) | WRD-420 to WRD-422, WRD-424 |
-| 5xx | [AI Security](./ai-security.md) | WRD-510, WRD-511, WRD-520, WRD-521, WRD-525 |
-| 6xx | [Steganography](./steganography.md) | WRD-601, WRD-602 |
-| 7xx | [Integrity](./integrity.md) | WRD-701, WRD-710 to WRD-714, WRD-720 |
-| 8xx | [Logic](./logic.md) | WRD-801, WRD-810 to WRD-812, WRD-820 to WRD-828, WRD-831, WRD-833 |
+| 3xx | [Supply Chain](./supply-chain.md) | WRD-301, WRD-302, WRD-310, WRD-311, WRD-313, WRD-314, WRD-324, WRD-331 to WRD-333, WRD-335, WRD-345 |
+| 4xx | [Permissions](./permissions.md) | WRD-421, WRD-422, WRD-424, WRD-440 |
+| 5xx | [AI Security](./ai-security.md) | WRD-510, WRD-511, WRD-521, WRD-522, WRD-525, WRD-526, WRD-527, WRD-540 |
+| 6xx | [Steganography](./steganography.md) | WRD-602, WRD-621 |
+| 7xx | [Integrity](./integrity.md) | WRD-701, WRD-712, WRD-714, WRD-715, WRD-721 to WRD-723, WRD-730 |
+| 8xx | [Logic](./logic.md) | WRD-801, WRD-802, WRD-810 to WRD-812, WRD-815 to WRD-817, WRD-823 to WRD-825, WRD-830, WRD-840 to WRD-843 |
 
 ## Severity Encoding
 
@@ -27,12 +27,14 @@ Severity is encoded in the last two digits of the rule number:
 | X10 - X19 | High |
 | X20 - X29 | Medium |
 | X30 - X39 | Low |
+| X40 - X49 | Info |
 
 Examples:
 - `WRD-101`: Injection, Critical (01)
 - `WRD-110`: Injection, High (10)
-- `WRD-320`: Supply Chain, Medium (20) // scanner promotes this to High when calculating fail-on threshold
-- `WRD-831`: Logic, Low (31)
+- `WRD-311`: Supply Chain, High (11) // third-party unpinned actions
+- `WRD-830`: Logic, Low (30)
+- `WRD-842`: Logic, Info (42)
 
 ## Severity Definitions
 
@@ -42,7 +44,9 @@ Examples:
 
 **Medium** - Increased risk that requires specific conditions to exploit, or defense-in-depth concern. Fix in near term.
 
-**Low** - Minor hardening gap, informational, or best-practice deviation. Address when convenient.
+**Low** - Minor hardening gap or best-practice deviation. Address when convenient.
+
+**Info** - Informational signal or documentation gap. Does not block; surfaces hygiene improvements.
 
 ## Suppressing Rules
 
@@ -51,11 +55,11 @@ parent directory of the scan target). The config file has just two fields:
 
 ```toml
 # Suppress specific rules
-disabled_rules = ["WRD-710", "WRD-826"]
+disabled_rules = ["WRD-730", "WRD-840"]
 
 # Override severities
 [severity_overrides]
-"WRD-322" = "low"
+"WRD-332" = "info"
 ```
 
 `disabled_rules` removes those rule IDs from every scan. There is no
@@ -65,10 +69,10 @@ per-file suppression and no category-level toggle in v1.0.
 
 Use the `[severity_overrides]` table to reclassify a rule's findings before
 the `--fail-on` threshold is applied. Severity values must be one of
-`critical`, `high`, `medium`, or `low`:
+`critical`, `high`, `medium`, `low`, or `info`:
 
 ```toml
 [severity_overrides]
 "WRD-525" = "high"
-"WRD-720" = "low"
+"WRD-723" = "low"
 ```

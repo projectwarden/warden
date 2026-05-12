@@ -1,53 +1,89 @@
-use regex::Regex;
-use std::sync::OnceLock;
-
-use super::{line_number_at_offset, Finding, Rule};
-use crate::scanner::Workflow;
+use super::{AuditCtx, Rule, RuleFinding, RuleMeta, Severity};
+use crate::models::Job;
+use crate::yamlpath::Span;
 
 pub struct Wrd712;
 
-fn re_unsecure_commands() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"ACTIONS_ALLOW_UNSECURE_COMMANDS\s*:\s*true").unwrap())
+fn env_says_true(
+    env: &std::collections::BTreeMap<String, crate::models::EnvValue>,
+    key: &str,
+) -> bool {
+    env.get(key)
+        .map(|v| {
+            let s = v.as_str_owned();
+            s.eq_ignore_ascii_case("true") || s == "1"
+        })
+        .unwrap_or(false)
 }
 
 impl Rule for Wrd712 {
-    fn id(&self) -> &str {
-        "WRD-712"
-    }
-    fn name(&self) -> &str {
-        "Insecure Commands"
-    }
-    fn severity(&self) -> &str {
-        "high"
-    }
-    fn description(&self) -> &str {
-        "Detects ACTIONS_ALLOW_UNSECURE_COMMANDS set to true, which re-enables \
-         deprecated set-env and add-path workflow commands"
-    }
-
-    fn check(&self, workflow: &Workflow) -> Vec<Finding> {
-        let mut findings = Vec::new();
-        let content = &workflow.content;
-
-        for m in re_unsecure_commands().find_iter(content) {
-            let line = line_number_at_offset(content, m.start());
-            findings.push(Finding {
-                rule_id: self.id().to_string(),
-                severity: self.severity().to_string(),
-                title: "ACTIONS_ALLOW_UNSECURE_COMMANDS is enabled".to_string(),
-                description: "Setting ACTIONS_ALLOW_UNSECURE_COMMANDS to true re-enables the \
-                    deprecated set-env and add-path commands, which are vulnerable to injection \
-                    attacks via untrusted input."
-                    .to_string(),
-                file: workflow.path.clone(),
-                line,
-                remediation: "Remove ACTIONS_ALLOW_UNSECURE_COMMANDS and use GITHUB_ENV / \
-                    GITHUB_PATH files instead of the legacy commands."
-                    .to_string(),
-            });
+    fn meta(&self) -> RuleMeta {
+        RuleMeta {
+            id: "WRD-712",
+            name: "Insecure Commands Allowed",
+            default_severity: Severity::High,
+            description: "ACTIONS_ALLOW_UNSECURE_COMMANDS re-enables the deprecated workflow \
+                          command syntax (set-env, add-path) used in legacy injection attacks.",
         }
+    }
 
+    fn audit(&self, ctx: &AuditCtx) -> Vec<RuleFinding> {
+        if ctx.loaded.is_stub {
+            return Vec::new();
+        }
+        let wf = &ctx.loaded.workflow;
+        let mut findings = Vec::new();
+        let key = "ACTIONS_ALLOW_UNSECURE_COMMANDS";
+
+        let mut emit = |path: &str| {
+            let span = ctx
+                .loaded
+                .spans
+                .get_str(path)
+                .unwrap_or_else(|| Span::new(0, 0, 1, 1, 1, 1));
+            findings.push(RuleFinding {
+                rule_id: "WRD-712",
+                severity: Severity::High,
+                title: "ACTIONS_ALLOW_UNSECURE_COMMANDS enabled".into(),
+                description: "This setting re-enables the deprecated `set-env` and `add-path` \
+                              workflow commands. They were removed in 2020 because attacker \
+                              output to stdout could escalate to environment variable / PATH \
+                              control."
+                    .into(),
+                primary: span,
+                related: Vec::new(),
+                remediation: "Remove ACTIONS_ALLOW_UNSECURE_COMMANDS. Use the modern \
+                              GITHUB_ENV / GITHUB_PATH files instead."
+                    .into(),
+            });
+        };
+
+        if let Some(env) = &wf.env {
+            if env_says_true(env, key) {
+                emit("env");
+            }
+        }
+        for (job_name, job) in &wf.jobs {
+            if let Job::Normal(j) = job {
+                if let Some(env) = &j.env {
+                    if env_says_true(env, key) {
+                        emit(&format!("jobs.{job_name}.env"));
+                    }
+                }
+                for (i, step) in j.steps.iter().enumerate() {
+                    let step_env = match step {
+                        crate::models::Step::Run(r) => r.env.as_ref(),
+                        crate::models::Step::Uses(u) => u.env.as_ref(),
+                        crate::models::Step::Other(_) => None,
+                    };
+                    if let Some(env) = step_env {
+                        if env_says_true(env, key) {
+                            emit(&format!("jobs.{job_name}.steps[{i}].env"));
+                        }
+                    }
+                }
+            }
+        }
         findings
     }
 }

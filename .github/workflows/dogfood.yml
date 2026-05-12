@@ -1,0 +1,49 @@
+name: Dogfood
+
+# Run warden against warden's own workflows. Separate from `ci.yml` so
+# scanner failures show up as a distinct CI status, and so rule-severity
+# shakeouts don't block unrelated build/test/lint feedback.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read  # warden needs to read .github/workflows/ to scan it
+
+jobs:
+  self-scan:
+    name: Warden self-scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # stable
+        with:
+          toolchain: stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: warden scan .
+        run: cargo run --release -- scan .
+
+      # Validate the GitHub-API code path stays alive. We use
+      # `actions/checkout` itself as the target: tiny, stable workflow set,
+      # public, and resolves the same auth path users would hit.
+      # `--fail-on none` because a third-party repo's hygiene is not our
+      # gate; we only want to know that the API path doesn't panic.
+      - name: warden scan actions/checkout (remote API smoke)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: cargo run --release -- scan actions/checkout --fail-on none

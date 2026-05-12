@@ -2,7 +2,7 @@
 
 ## cargo install
 
-Requires Rust 1.70 or later. Install via crates.io:
+Requires Rust 1.74 or later. Install via crates.io:
 
 ```bash
 cargo install wardenscan
@@ -55,7 +55,7 @@ Add warden to any workflow to scan on every push and pull request. See the [GitH
 
 ```yaml
 - name: Run warden
-  uses: projectwarden/warden@v1
+  uses: projectwarden/warden@a3c26c3f1897ddbe5c34cc3ce9ff4f14f84c83a8  # v2.0.0
   with:
     path: .github/workflows
     fail-on: high

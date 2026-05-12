@@ -1,6 +1,6 @@
 # AI Security Rules (500s)
 
-These rules cover AI-related risks and CI/CD automation hygiene. The 510s address AI configuration poisoning via fork-checkout in privileged workflow contexts. The 520s cover Dependabot security and trusted publishing patterns.
+These rules cover AI-related risks and CI/CD automation hygiene. The 510s address AI configuration poisoning via fork-checkout in privileged workflow contexts. The 520s cover Dependabot security and trusted publishing patterns. WRD-540 surfaces a Dependabot scheduling hygiene signal.
 
 ---
 
@@ -80,9 +80,143 @@ jobs:
 
 ---
 
-## WRD-520: Dependabot Cooldown
+## WRD-521: Dependabot PR Untrusted Execution
 
 **Severity:** Medium
+
+**What it detects:** Dependabot-related workflows that use `pull_request_target` and check out the PR head ref. With `pull_request_target`, the workflow runs with write permissions and access to secrets. Checking out untrusted PR code in this context allows arbitrary code execution with elevated privileges.
+
+**Vulnerable:**
+
+```yaml
+on: pull_request_target
+
+jobs:
+  auto-merge:
+    if: github.actor == 'dependabot[bot]'
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+      - run: npm install && npm test
+```
+
+**Remediation:** Avoid checking out the PR head in `pull_request_target` workflows. If you must, run untrusted code in a separate unprivileged workflow triggered by `pull_request` instead.
+
+---
+
+## WRD-525: Long-Lived Publish Token In Use
+
+**Severity:** Medium
+
+**What it detects:** PyPI publish workflows using stored API tokens (`PYPI_TOKEN`, `PYPI_API_TOKEN`, `PYPI_PASSWORD`) or npm publish workflows using `NPM_TOKEN` instead of OIDC-based trusted publishing. Trusted publishing is more secure because it eliminates stored secrets entirely.
+
+**Vulnerable:**
+
+```yaml
+- uses: pypa/gh-action-pypi-publish@release/v1
+  with:
+    password: ${{ secrets.PYPI_TOKEN }}
+```
+
+**Remediation:** Configure PyPI Trusted Publishing and add `id-token: write` to permissions. Remove stored API token secrets.
+
+```yaml
+permissions:
+  id-token: write
+
+steps:
+  - uses: pypa/gh-action-pypi-publish@release/v1
+    # No password needed with Trusted Publishing
+```
+
+See [PyPI Trusted Publishers docs](https://docs.pypi.org/trusted-publishers/) for setup.
+
+---
+
+## WRD-522: AI Agent Permission Bypass Flags
+
+**Severity:** Medium (High when the trigger is `pull_request_target`, `workflow_run`, or `issue_comment`)
+
+**What it detects:** `run:` blocks that invoke an AI coding-agent CLI (`claude`, `cursor-agent`, `gemini`, `codex`, `aider`, `continue`, `cline`) with a permission-bypass flag (`--dangerously-skip-permissions`, `--yolo`, `--trust-all-tools`, `--full-auto`, `-y`, `--unsafe`, `--no-confirm`). This is the exact post-exploitation pivot used by the Nx `s1ngularity` npm supply-chain attack in August 2025 to enumerate developer secrets from the victim's filesystem without prompting.
+
+Escalates to High when the workflow trigger is externally controllable, because in that case an attacker (via a PR, an issue comment, or a workflow_run dispatch) can influence what the agent reads.
+
+**Vulnerable:**
+
+```yaml
+on: pull_request_target
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: |
+          claude --dangerously-skip-permissions --prompt "$PROMPT"
+```
+
+**Remediation:** remove the bypass flag and let the agent prompt per tool call, or constrain the agent's workspace so there is no secret material / outbound-network capability in reach, or move the step to a workflow that is not externally triggerable.
+
+Nobody else in the GitHub Actions static-analysis space currently detects this pattern.
+
+---
+
+## WRD-526: GitHub App Token Misuse
+
+**Severity:** Medium (High for `skip-token-revoke: true`)
+
+**What it detects:** Workflows using `actions/create-github-app-token` (or common forks: `tibdex/github-app-token`, `getsentry/action-github-app-token`) with one or more of three misconfigurations that extend the token's validity window or its blast radius:
+
+1. `skip-token-revoke: true` (High). The token is not revoked at the end of the job, so it stays valid long after the workflow run ends; any log leak during that window lets an attacker keep using it.
+2. No `repositories:` specified (Medium). The minted token is valid against every repo the GitHub App is installed in, not just the one this job operates on.
+3. No `permissions:` specified (Medium). The token inherits every permission the GitHub App was granted at install time.
+
+**Vulnerable:**
+
+```yaml
+- uses: actions/create-github-app-token@v1
+  with:
+    app-id: ${{ vars.APP_ID }}
+    private-key: ${{ secrets.APP_PRIVATE_KEY }}
+    skip-token-revoke: true
+```
+
+**Remediation:** Specify `repositories:` (narrow), specify `permissions:` (least-privilege), and let revocation run by default.
+
+```yaml
+- uses: actions/create-github-app-token@v1
+  with:
+    app-id: ${{ vars.APP_ID }}
+    private-key: ${{ secrets.APP_PRIVATE_KEY }}
+    repositories: this-repo
+    permissions: |
+      contents: read
+      pull_requests: write
+```
+
+---
+
+## WRD-527: Registry Publish Without Trusted Publishing
+
+**Severity:** Medium
+
+**What it detects:** Complements WRD-525 (PyPI + npm) by flagging the same class of long-lived-publish-token use against Cargo (crates.io) and RubyGems. Both registries shipped OIDC-based trusted publishing in late 2025, so using a stored `CARGO_REGISTRY_TOKEN`, `CRATES_IO_TOKEN`, `GEM_HOST_API_KEY`, or `RUBYGEMS_API_KEY` is now the legacy path. Also catches `cargo publish` and `gem push` directly inside a `run:` block.
+
+**Vulnerable:**
+
+```yaml
+- run: cargo publish --token $TOKEN
+  env:
+    TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+```
+
+**Remediation:** Configure the registry's OIDC trusted-publisher flow, add `permissions: id-token: write`, and remove the stored token secret. See crates.io's "trusted publishing" docs and RubyGems' OIDC guide.
+
+---
+
+## WRD-540: Dependabot Daily Without Grouping
+
+**Severity:** Info
 
 **What it detects:** Dependabot configurations (`dependabot.yml`) with daily update schedules but no dependency grouping. This can produce a high volume of individual PRs, overwhelming reviewers and CI resources.
 
@@ -110,57 +244,3 @@ updates:
       production-dependencies:
         patterns: ['*']
 ```
-
----
-
-## WRD-521: Dependabot Insecure Execution
-
-**Severity:** Medium
-
-**What it detects:** Dependabot-related workflows that use `pull_request_target` and check out the PR head ref. With `pull_request_target`, the workflow runs with write permissions and access to secrets. Checking out untrusted PR code in this context allows arbitrary code execution with elevated privileges.
-
-**Vulnerable:**
-
-```yaml
-on: pull_request_target
-
-jobs:
-  auto-merge:
-    if: github.actor == 'dependabot[bot]'
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
-        with:
-          ref: ${{ github.event.pull_request.head.sha }}
-      - run: npm install && npm test
-```
-
-**Remediation:** Avoid checking out the PR head in `pull_request_target` workflows. If you must, run untrusted code in a separate unprivileged workflow triggered by `pull_request` instead.
-
----
-
-## WRD-525: Use Trusted Publishing
-
-**Severity:** Medium
-
-**What it detects:** PyPI publish workflows using stored API tokens (`PYPI_TOKEN`, `PYPI_API_TOKEN`, `PYPI_PASSWORD`) or npm publish workflows using `NPM_TOKEN` instead of OIDC-based trusted publishing. Trusted publishing is more secure because it eliminates stored secrets entirely.
-
-**Vulnerable:**
-
-```yaml
-- uses: pypa/gh-action-pypi-publish@release/v1
-  with:
-    password: ${{ secrets.PYPI_TOKEN }}
-```
-
-**Remediation:** Configure PyPI Trusted Publishing and add `id-token: write` to permissions. Remove stored API token secrets.
-
-```yaml
-permissions:
-  id-token: write
-
-steps:
-  - uses: pypa/gh-action-pypi-publish@release/v1
-    # No password needed with Trusted Publishing
-```
-
-See [PyPI Trusted Publishers docs](https://docs.pypi.org/trusted-publishers/) for setup.

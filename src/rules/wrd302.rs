@@ -1,11 +1,8 @@
 use regex::Regex;
 
-use crate::rules::{line_number_at_offset, Finding, Rule};
-use crate::scanner::Workflow;
-
-/// WRD-302: Known vulnerable actions.
-/// Detects usage of GitHub Actions with known security vulnerabilities.
-pub struct Wrd302;
+use crate::models::{Job, Step};
+use crate::rules::{AuditCtx, Rule, RuleFinding, RuleMeta, Severity};
+use crate::yamlpath::Span;
 
 struct VulnerableAction {
     /// Regex pattern to match the action reference in uses: directives.
@@ -93,45 +90,59 @@ const VULNERABLE_ACTIONS: &[VulnerableAction] = &[
     },
 ];
 
+// ---------------------------------------------------------------------------
+// V2: typed-model walk over `jobs.*.steps[*].uses` and match each `uses` string
+// against the VULNERABLE_ACTIONS regex catalog. No free-text scan, no false
+// matches on commented-out lines or strings that happen to mention the ref.
+// ---------------------------------------------------------------------------
+
+pub struct Wrd302;
+
 impl Rule for Wrd302 {
-    fn id(&self) -> &str {
-        "WRD-302"
+    fn meta(&self) -> RuleMeta {
+        RuleMeta {
+            id: "WRD-302",
+            name: "Known Vulnerable Action",
+            default_severity: Severity::Critical,
+            description: "Workflow uses a GitHub Action with known security vulnerabilities or \
+                          that was involved in a supply chain compromise.",
+        }
     }
 
-    fn name(&self) -> &str {
-        "Known Vulnerable Action"
-    }
-
-    fn severity(&self) -> &str {
-        "critical"
-    }
-
-    fn description(&self) -> &str {
-        "Workflow uses a GitHub Action with known security vulnerabilities or \
-         that was involved in a supply chain compromise."
-    }
-
-    fn check(&self, workflow: &Workflow) -> Vec<Finding> {
+    fn audit(&self, ctx: &AuditCtx) -> Vec<RuleFinding> {
+        if ctx.loaded.is_stub {
+            return Vec::new();
+        }
         let mut findings = Vec::new();
-        let content = &workflow.content;
+        let wf = &ctx.loaded.workflow;
 
-        for vuln in VULNERABLE_ACTIONS {
-            let re = match Regex::new(vuln.pattern) {
-                Ok(r) => r,
-                Err(_) => continue,
-            };
+        let compiled: Vec<(Regex, &VulnerableAction)> = VULNERABLE_ACTIONS
+            .iter()
+            .filter_map(|v| Regex::new(v.pattern).ok().map(|r| (r, v)))
+            .collect();
 
-            for m in re.find_iter(content) {
-                let line = line_number_at_offset(content, m.start());
-                findings.push(Finding {
-                    rule_id: self.id().to_string(),
-                    severity: self.severity().to_string(),
-                    title: format!("Known vulnerable action: {}", vuln.action_name),
-                    description: vuln.description.to_string(),
-                    file: workflow.path.clone(),
-                    line,
-                    remediation: vuln.remediation.to_string(),
-                });
+        for (job_name, job) in &wf.jobs {
+            let Job::Normal(j) = job else { continue };
+            for (i, step) in j.steps.iter().enumerate() {
+                let Step::Uses(u) = step else { continue };
+                for (re, vuln) in &compiled {
+                    if re.is_match(&u.uses) {
+                        let span = ctx
+                            .loaded
+                            .spans
+                            .get_str(&format!("jobs.{job_name}.steps[{i}]"))
+                            .unwrap_or_else(|| Span::new(0, 0, 1, 1, 1, 1));
+                        findings.push(RuleFinding {
+                            rule_id: "WRD-302",
+                            severity: Severity::Critical,
+                            title: format!("Known vulnerable action: {}", vuln.action_name),
+                            description: vuln.description.to_string(),
+                            primary: span,
+                            related: Vec::new(),
+                            remediation: vuln.remediation.to_string(),
+                        });
+                    }
+                }
             }
         }
 

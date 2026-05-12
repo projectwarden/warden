@@ -1,4 +1,7 @@
 pub mod github;
+mod loaded;
+
+pub use loaded::{load_one, stub_workflow, LoadedFile, LoadedWorkflow};
 
 use std::collections::HashSet;
 use std::fs;
@@ -88,8 +91,8 @@ pub fn load_local(path: &str) -> Result<Vec<Workflow>> {
         });
     }
 
-    // Also pick up `.github/dependabot.yml` if present, so rules like WRD-520
-    // (Dependabot Cooldown) and WRD-521 (Dependabot Insecure Execution) have
+    // Also pick up `.github/dependabot.yml` if present, so rules like WRD-540
+    // (Dependabot Daily Without Grouping) and WRD-521 (Dependabot PR Untrusted Execution) have
     // a target to scan. The dependabot config isn't a workflow but is part of
     // the same security surface.
     let dependabot_path = p.join(".github").join("dependabot.yml");
@@ -122,6 +125,71 @@ pub fn load_github(owner: &str, repo: &str, token: Option<&str>) -> Result<Vec<W
     github::load_github(owner, repo, token)
 }
 
+/// Span-aware, typed counterpart to [`load_local`]. Returns a [`LoadedFile`]
+/// per discovered YAML so V2 rules can consume typed nodes plus byte-exact
+/// spans without re-parsing.
+pub fn load_local_typed(path: &str) -> Result<Vec<LoadedFile>> {
+    let p = Path::new(path);
+
+    if !p.exists() {
+        bail!("Path does not exist: {path}");
+    }
+
+    let mut out = Vec::new();
+
+    if p.is_file() {
+        let raw = fs::read_to_string(p).with_context(|| format!("Failed to read file: {path}"))?;
+        out.push(load_one(p.to_path_buf(), raw)?);
+        return Ok(out);
+    }
+
+    let workflow_dir: PathBuf;
+    let candidate = p.join(".github").join("workflows");
+    if candidate.is_dir() {
+        workflow_dir = candidate;
+    } else if p.is_dir() {
+        workflow_dir = p.to_path_buf();
+    } else {
+        bail!(
+            "Could not find workflow files at {path}. Expected a .github/workflows/ directory or a YAML file."
+        );
+    }
+
+    let entries = fs::read_dir(&workflow_dir)
+        .with_context(|| format!("Failed to read directory: {}", workflow_dir.display()))?;
+
+    for entry in entries {
+        let entry = entry.context("Failed to read directory entry")?;
+        let file_path = entry.path();
+        let name = file_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if !(name.ends_with(".yml") || name.ends_with(".yaml")) {
+            continue;
+        }
+        let raw = fs::read_to_string(&file_path)
+            .with_context(|| format!("Failed to read {}", file_path.display()))?;
+        let relative = file_path
+            .strip_prefix(p)
+            .unwrap_or(&file_path)
+            .to_path_buf();
+        out.push(load_one(relative, raw)?);
+    }
+
+    let dependabot_path = p.join(".github").join("dependabot.yml");
+    if dependabot_path.is_file() {
+        if let Ok(raw) = fs::read_to_string(&dependabot_path) {
+            let relative = dependabot_path
+                .strip_prefix(p)
+                .unwrap_or(&dependabot_path)
+                .to_path_buf();
+            if let Ok(loaded) = load_one(relative, raw) {
+                out.push(loaded);
+            }
+        }
+    }
+
+    Ok(out)
+}
+
 /// Run all rules against the provided workflows and return deduplicated findings.
 pub fn scan(workflows: &[Workflow]) -> Vec<Finding> {
     scan_with_config(workflows, None)
@@ -139,8 +207,9 @@ pub fn scan_full(
     config: Option<&WardenConfig>,
     emit_progress: bool,
 ) -> Vec<Finding> {
-    let all = rules::all_rules();
+    let v2 = rules::all_rules();
     let mut findings = Vec::new();
+    let mut ignore_maps: Vec<(String, crate::ignores::IgnoreMap)> = Vec::new();
 
     if emit_progress {
         let ev = serde_json::json!({
@@ -161,16 +230,65 @@ pub fn scan_full(
             });
             eprintln!("{ev}");
         }
-        for rule in &all {
-            if let Some(cfg) = config {
-                if cfg.is_disabled(rule.id()) {
-                    continue;
+
+        // Parse inline `# warden: ignore[...]` directives once per file.
+        ignore_maps.push((
+            workflow.path.clone(),
+            crate::ignores::parse(&workflow.content),
+        ));
+
+        // Rules run against a typed `LoadedWorkflow`, rebuilt from the
+        // legacy `Workflow`'s raw content. Non-workflow YAMLs (dependabot.yml)
+        // go through a stub so rules that only consume raw text can fire.
+        if !v2.is_empty() {
+            let loaded_opt = match loaded::load_one(
+                std::path::PathBuf::from(&workflow.path),
+                workflow.content.clone(),
+            ) {
+                Ok(LoadedFile::Workflow(w)) => Some(*w),
+                Ok(LoadedFile::Other {
+                    path, raw, spans, ..
+                }) => Some(loaded::stub_workflow(path, raw, spans)),
+                Err(_) => None,
+            };
+            if let Some(loaded_wf) = loaded_opt {
+                let expr_index = crate::expression::ExprIndex::build(&loaded_wf.workflow);
+                let shell_index = crate::shell::ShellIndex::build(&loaded_wf.workflow);
+                let provenance = crate::taint::build_provenance(&loaded_wf.workflow);
+                let ignores_for_ctx = &ignore_maps.last().unwrap().1;
+                let ctx = rules::AuditCtx {
+                    loaded: &loaded_wf,
+                    expressions: &expr_index,
+                    shell: &shell_index,
+                    ignores: ignores_for_ctx,
+                    provenance: &provenance,
+                };
+                for rule in &v2 {
+                    let meta = rule.meta();
+                    if let Some(cfg) = config {
+                        if cfg.is_disabled(meta.id) {
+                            continue;
+                        }
+                    }
+                    for fv2 in rule.audit(&ctx) {
+                        findings.push(fv2.into_legacy(&workflow.path));
+                    }
                 }
             }
-            let mut results = rule.check(workflow);
-            findings.append(&mut results);
         }
     }
+
+    // Apply inline-ignore suppressions before dedupe / sort.
+    findings.retain(|f| {
+        let map = ignore_maps
+            .iter()
+            .find(|(p, _)| p == &f.file)
+            .map(|(_, m)| m);
+        match map {
+            Some(m) => !m.is_suppressed(&f.rule_id, f.line),
+            None => true,
+        }
+    });
 
     // Deduplicate by (rule_id, file, line, title)
     let mut seen = HashSet::new();

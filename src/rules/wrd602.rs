@@ -1,12 +1,7 @@
 use regex::Regex;
 
-use crate::rules::{line_number_at_offset, Finding, Rule};
-use crate::scanner::Workflow;
-
-/// WRD-602: Indicators of compromise (IOC) patterns.
-/// Detects suspicious patterns like eval+base64, known C2 domains,
-/// reverse shells, and other indicators of malicious activity.
-pub struct Wrd602;
+use crate::rules::{line_number_at_offset, AuditCtx, Rule, RuleFinding, RuleMeta, Severity};
+use crate::yamlpath::Span;
 
 struct IocPattern {
     pattern: &'static str,
@@ -87,43 +82,45 @@ const IOC_PATTERNS: &[IocPattern] = &[
     },
 ];
 
+// ---------------------------------------------------------------------------
+// V2: raw-text regex scan. IoC patterns can hide in any string, comment,
+// or name so there is no single typed surface to walk.
+// ---------------------------------------------------------------------------
+
+pub struct Wrd602;
+
 impl Rule for Wrd602 {
-    fn id(&self) -> &str {
-        "WRD-602"
+    fn meta(&self) -> RuleMeta {
+        RuleMeta {
+            id: "WRD-602",
+            name: "Workflow Embedded IOC",
+            default_severity: Severity::Critical,
+            description: "Suspicious patterns that may indicate malicious activity, including \
+                          obfuscated payloads, reverse shells, and C2 communication.",
+        }
     }
 
-    fn name(&self) -> &str {
-        "Indicator of Compromise"
-    }
-
-    fn severity(&self) -> &str {
-        "critical"
-    }
-
-    fn description(&self) -> &str {
-        "Suspicious patterns that may indicate malicious activity, including \
-         obfuscated payloads, reverse shells, and C2 communication."
-    }
-
-    fn check(&self, workflow: &Workflow) -> Vec<Finding> {
+    fn audit(&self, ctx: &AuditCtx) -> Vec<RuleFinding> {
         let mut findings = Vec::new();
-        let content = &workflow.content;
+        let content = &ctx.loaded.raw;
 
         for ioc in IOC_PATTERNS {
             let re = match Regex::new(ioc.pattern) {
                 Ok(r) => r,
                 Err(_) => continue,
             };
-
             for m in re.find_iter(content) {
-                let line = line_number_at_offset(content, m.start());
-                findings.push(Finding {
-                    rule_id: self.id().to_string(),
-                    severity: self.severity().to_string(),
+                let start = m.start();
+                let end = m.end();
+                let line = line_number_at_offset(content, start);
+                let span = Span::new(start, end, line, 1, line, 1);
+                findings.push(RuleFinding {
+                    rule_id: "WRD-602",
+                    severity: Severity::Critical,
                     title: ioc.title.to_string(),
                     description: ioc.description.to_string(),
-                    file: workflow.path.clone(),
-                    line,
+                    primary: span,
+                    related: Vec::new(),
                     remediation: "Investigate the flagged pattern. If it is not intentional, \
                                   remove it immediately and audit recent changes to the workflow."
                         .to_string(),

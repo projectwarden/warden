@@ -1,10 +1,8 @@
 use regex::Regex;
 use std::sync::OnceLock;
 
-use super::{line_number_at_offset, Finding, Rule};
-use crate::scanner::Workflow;
-
-pub struct Wrd714;
+use super::{AuditCtx, Rule, RuleFinding, RuleMeta, Severity};
+use crate::yamlpath::Span;
 
 fn re_curl_pipe() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
@@ -13,44 +11,70 @@ fn re_curl_pipe() -> &'static Regex {
     })
 }
 
+// ---------------------------------------------------------------------------
+// V2: scan parsed shell scripts. Narrows the regex to `run:` bodies only,
+// avoiding false positives in comments or `name:` fields that the legacy
+// full-file match would catch.
+// ---------------------------------------------------------------------------
+
+pub struct Wrd714;
+
 impl Rule for Wrd714 {
-    fn id(&self) -> &str {
-        "WRD-714"
-    }
-    fn name(&self) -> &str {
-        "Curl Pipe Bash"
-    }
-    fn severity(&self) -> &str {
-        "high"
-    }
-    fn description(&self) -> &str {
-        "Detects curl|bash, wget|sh, and similar patterns that execute remote \
-         scripts without verification"
-    }
-
-    fn check(&self, workflow: &Workflow) -> Vec<Finding> {
-        let mut findings = Vec::new();
-        let content = &workflow.content;
-
-        for m in re_curl_pipe().find_iter(content) {
-            let line = line_number_at_offset(content, m.start());
-            findings.push(Finding {
-                rule_id: self.id().to_string(),
-                severity: self.severity().to_string(),
-                title: "Remote script executed via pipe to shell".to_string(),
-                description: format!(
-                    "Pattern '{}' downloads and immediately executes a remote script. \
-                     A compromised server or MITM attack could inject malicious code.",
-                    m.as_str().trim()
-                ),
-                file: workflow.path.clone(),
-                line,
-                remediation: "Download the script first, verify its checksum or signature, \
-                    then execute it. Or vendor the script into the repository."
-                    .to_string(),
-            });
+    fn meta(&self) -> RuleMeta {
+        RuleMeta {
+            id: "WRD-714",
+            name: "Curl Pipe Bash",
+            default_severity: Severity::High,
+            description: "Detects curl|bash, wget|sh, and similar patterns that execute remote \
+                          scripts without verification.",
         }
+    }
 
-        findings
+    fn audit(&self, ctx: &AuditCtx) -> Vec<RuleFinding> {
+        #[cfg(feature = "shell-analysis")]
+        {
+            let mut findings = Vec::new();
+            for occ in ctx.shell.occurrences() {
+                for m in re_curl_pipe().find_iter(&occ.script) {
+                    let span = ctx
+                        .loaded
+                        .spans
+                        .get_str(&occ.path)
+                        .unwrap_or_else(|| Span::new(0, 0, 1, 1, 1, 1));
+                    let offset_line = occ.script[..m.start()].matches('\n').count();
+                    let actual_line = span.start_line + offset_line;
+                    let line_span = Span::new(
+                        span.byte_start,
+                        span.byte_end,
+                        actual_line,
+                        span.start_col,
+                        actual_line,
+                        span.end_col,
+                    );
+                    findings.push(RuleFinding {
+                        rule_id: "WRD-714",
+                        severity: Severity::High,
+                        title: "Remote script executed via pipe to shell".to_string(),
+                        description: format!(
+                            "Pattern '{}' downloads and immediately executes a remote script. \
+                             A compromised server or MITM attack could inject malicious code.",
+                            m.as_str().trim()
+                        ),
+                        primary: line_span,
+                        related: Vec::new(),
+                        remediation: "Download the script first, verify its checksum or \
+                                      signature, then execute it. Or vendor the script into \
+                                      the repository."
+                            .to_string(),
+                    });
+                }
+            }
+            findings
+        }
+        #[cfg(not(feature = "shell-analysis"))]
+        {
+            let _ = ctx;
+            Vec::new()
+        }
     }
 }

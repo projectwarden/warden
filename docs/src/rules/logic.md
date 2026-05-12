@@ -33,7 +33,34 @@ jobs:
 
 ---
 
-## WRD-810: Confused Deputy
+## WRD-802: Runtime Self-Hosted Runner Registration
+
+**Severity:** Critical
+
+**What it detects:** Workflows that register or start a self-hosted runner from inside a `run:` block. Different from WRD-801 (which flags workflows that *use* self-hosted runners on a PR trigger); this rule flags workflows that *register* a fresh runner at runtime, which is a persistence primitive the Shai-Hulud 2.0 npm worm used to compromise 25 000+ repositories in November 2025.
+
+Three specific patterns fire:
+
+1. `config.sh ... --token ...` or `./config.sh ... --token ...`, the actions-runner registration command.
+2. `./run.sh` or `run.sh`, starting a configured runner.
+3. `RUNNER_ALLOW_RUNASROOT=1`, which lets the runner start as root (rarely needed in legitimate CI).
+4. The literal string `SHA1HULUD` (runner-name IOC from Unit 42's Shai-Hulud 2.0 report), which escalates the finding to a direct IOC match.
+
+**Vulnerable:**
+
+```yaml
+- run: |
+    ./config.sh --url https://github.com/victim/org --token SECRET --name SHA1HULUD
+    ./run.sh
+```
+
+**Remediation:** Do not register self-hosted runners from inside a workflow. Provision runners out-of-band via Terraform, an org-level control plane, or GitHub's managed runner autoscaler. If you see an unexpected runner appearing after a commit, investigate immediately; revoke org-level runners named `SHA1HULUD` and audit recent commits for the `bun_environment.js` / `setup_bun.js` payloads associated with Shai-Hulud 2.0.
+
+See [Unit 42's Shai-Hulud 2.0 writeup](https://unit42.paloaltonetworks.com/npm-supply-chain-attack/) for full IOC detail.
+
+---
+
+## WRD-810: Auto-Merge Without Authorization
 
 **Severity:** High
 
@@ -49,7 +76,7 @@ jobs:
 
 ---
 
-## WRD-811: Artifact Injection
+## WRD-811: Artifact Download Without Conclusion Check
 
 **Severity:** High
 
@@ -81,7 +108,7 @@ jobs:
 
 ---
 
-## WRD-812: Risky Trigger Default Permissions
+## WRD-812: Risky Trigger Without Permissions Block
 
 **Severity:** High
 
@@ -119,26 +146,25 @@ jobs:
 
 ---
 
-## WRD-820: Unsound Condition
+## WRD-815: Secret Redaction Bypass
 
-**Severity:** Medium
+**Severity:** High
 
-**What it detects:** Conditions that are always true: `if: true`, `if: always()`, or self-comparisons. These make the condition a no-op guard.
+**What it detects:** Patterns that bypass GitHub Actions secret redaction in logs: base64-encoding secrets, manipulating secrets with text tools (`sed`, `tr`, `cut`, `fold`, `rev`), or writing secrets to files then reading them back. The transformed output is not masked by GitHub Actions.
 
 **Vulnerable:**
 
 ```yaml
-- if: always()
-  run: ./security-scan.sh
+- run: echo "${{ secrets.API_KEY }}" | base64
 ```
 
-**Remediation:** Replace with a meaningful condition, or remove the `if:` block if the step should always run.
+**Remediation:** Avoid encoding or transforming secrets in ways that bypass redaction. Pass secrets directly to the tools that need them. Never echo or log transformed secret values.
 
 ---
 
-## WRD-821: Bypassable Contains Check
+## WRD-816: Bypassable Contains Authorization
 
-**Severity:** Medium
+**Severity:** High
 
 **What it detects:** `contains()` checks on user-controlled input (`github.event.issue.title`, `github.event.pull_request.body`, `github.head_ref`, `github.actor`, etc.) used as authorization gates. An attacker can include the expected substring in their input to bypass the check.
 
@@ -153,23 +179,24 @@ jobs:
 
 ---
 
-## WRD-822: Secret Redaction Bypass
+## WRD-817: Base64 Payload in Workflow YAML
 
-**Severity:** Medium
+**Severity:** High
 
-**What it detects:** Patterns that bypass GitHub Actions secret redaction in logs: base64-encoding secrets, manipulating secrets with text tools (`sed`, `tr`, `cut`, `fold`, `rev`), or writing secrets to files then reading them back. The transformed output is not masked by GitHub Actions.
+**What it detects:** Base64 decode operations (`base64 -d`, `atob`, `Buffer.from(..., 'base64')`) appearing in non-`run:` contexts (env blocks, `with:` inputs). This is unusual and may indicate an attempt to obfuscate malicious content.
 
 **Vulnerable:**
 
 ```yaml
-- run: echo "${{ secrets.API_KEY }}" | base64
+env:
+  PAYLOAD: $(echo "bWFsaWNpb3Vz" | base64 -d)
 ```
 
-**Remediation:** Avoid encoding or transforming secrets in ways that bypass redaction. Pass secrets directly to the tools that need them. Never echo or log transformed secret values.
+**Remediation:** If base64 encoding is necessary for legitimate data (certificates, binary config), move the decode into a `run:` block with clear documentation explaining its purpose.
 
 ---
 
-## WRD-823: Cache Poisoning
+## WRD-823: Cache Poisoning Risk
 
 **Severity:** Medium
 
@@ -198,7 +225,7 @@ jobs:
 
 ---
 
-## WRD-824: Excessive Permissions
+## WRD-824: Excessive Permissions Or Missing Block
 
 **Severity:** Medium
 
@@ -231,7 +258,7 @@ jobs:
 
 ---
 
-## WRD-825: Spoofable Bot Check
+## WRD-825: Spoofable Bot Identity Check
 
 **Severity:** Medium
 
@@ -251,9 +278,35 @@ jobs:
 
 ---
 
-## WRD-826: Undocumented Permissions
+## WRD-830: Unsound If-Condition
 
-**Severity:** Medium
+**Severity:** Low
+
+**What it detects:** `if:` conditions whose value is known at parse time, which means the condition is not actually gating anything. Covers three families:
+
+1. **Always-true**: `if: true`, `if: "true"`, `if: ${{ true }}`, `if: always()`, or self-comparisons like `if: 1 == 1` / `if: 'a' == 'a'`.
+2. **Always-false**: `if: "false"`, `if: ${{ false }}`, `if: 1 == 0`, etc. These make the step/job dead code.
+3. **Tautological / contradictory string checks**: `contains('abc', 'b')`, `startsWith('hello-world', 'hello')`, `endsWith('x.yaml', '.yml')` — both sides are literals, so the answer is known at parse time.
+
+A `${{ ... }}` wrapper is transparently unwrapped before classification.
+
+**Vulnerable:**
+
+```yaml
+- if: always()
+  run: ./security-scan.sh
+
+- if: ${{ contains('abc', 'b') }}  # always true
+  run: ./deploy.sh
+```
+
+**Remediation:** Replace with a condition that actually depends on runtime inputs (`github.*`, `inputs.*`, `env.*`, `steps.*.outputs.*`), or remove the `if:` entirely if the step should always run.
+
+---
+
+## WRD-840: Undocumented Permissions
+
+**Severity:** Info
 
 **What it detects:** Permission entries (e.g., `contents: write`, `packages: write`) that lack an explanatory comment. Documenting permissions makes security reviews easier and helps future maintainers understand the intent behind each grant.
 
@@ -277,9 +330,9 @@ permissions:
 
 ---
 
-## WRD-827: Superfluous Actions
+## WRD-841: Superfluous Setup Action
 
-**Severity:** Medium
+**Severity:** Info
 
 **What it detects:** Setup actions (e.g., `actions/setup-node`, `actions/setup-python`, `actions/setup-go`) used without specifying a version input. These tools are pre-installed on GitHub-hosted runners, so the setup action adds overhead without benefit if the default version is sufficient.
 
@@ -300,60 +353,9 @@ permissions:
 
 ---
 
-## WRD-828: Obfuscation in Workflow
+## WRD-842: Missing Concurrency Limits
 
-**Severity:** Medium
-
-**What it detects:** Base64 decode operations (`base64 -d`, `atob`, `Buffer.from(..., 'base64')`) appearing in non-`run:` contexts (env blocks, `with:` inputs). This is unusual and may indicate an attempt to obfuscate malicious content.
-
-**Vulnerable:**
-
-```yaml
-env:
-  PAYLOAD: $(echo "bWFsaWNpb3Vz" | base64 -d)
-```
-
-**Remediation:** If base64 encoding is necessary for legitimate data (certificates, binary config), move the decode into a `run:` block with clear documentation explaining its purpose.
-
----
-
-## WRD-833: Anonymous Workflow Definition
-
-**Severity:** Low
-
-**What it detects:** Two patterns:
-
-1. Actions pinned to branch names like `@main` or `@master` instead of a commit SHA or version tag. Branch tips change with every commit, making builds non-reproducible.
-2. Workflow files missing a top-level `name:` key. Without a name, the workflow appears as the filename in the GitHub Actions UI.
-
-**Vulnerable:**
-
-```yaml
-# Missing name:
-on: push
-jobs:
-  build:
-    steps:
-      - uses: some-org/action@main
-```
-
-**Remediation:** Pin actions to full commit SHAs. Add a descriptive `name:` key at the top of workflow files.
-
-```yaml
-name: CI Build
-
-on: push
-jobs:
-  build:
-    steps:
-      - uses: some-org/action@a1b2c3d4e5f6...  # v1.2.0
-```
-
----
-
-## WRD-831: Missing Concurrency Limits
-
-**Severity:** Low
+**Severity:** Info
 
 **What it detects:** Workflows triggered by `push` or `pull_request` that do not define a `concurrency:` block. Without concurrency limits, rapid pushes can queue many redundant runs, wasting runner resources.
 
@@ -382,4 +384,35 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - run: make build
+```
+
+---
+
+## WRD-843: Missing Workflow Name
+
+**Severity:** Info
+
+**What it detects:** Workflow files missing a top-level `name:` key. Without a name, the workflow appears as the filename in the GitHub Actions UI, making it harder to identify in run lists, status checks, and notifications.
+
+**Vulnerable:**
+
+```yaml
+# Missing name:
+on: push
+jobs:
+  build:
+    steps:
+      - uses: some-org/action@a1b2c3d4e5f6...  # v1.2.0
+```
+
+**Remediation:** Add a descriptive `name:` key at the top of the workflow file.
+
+```yaml
+name: CI Build
+
+on: push
+jobs:
+  build:
+    steps:
+      - uses: some-org/action@a1b2c3d4e5f6...  # v1.2.0
 ```

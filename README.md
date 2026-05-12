@@ -1,9 +1,8 @@
 # warden
 
-CI/CD security scanner for GitHub Actions workflows. 53 detection rules
-across 8 attack classes (injection, triggers, supply chain, permissions,
-AI security, steganography, integrity, logic). Single static binary, zero
-runtime dependencies, auto-fix engine, JSON / SARIF / Markdown output.
+GitHub Actions security scanner. 59 detection rules across 8 attack classes (injection, triggers, supply chain, permissions, AI security, steganography, integrity, logic). Single static binary, zero runtime dependencies, auto-fix engine, JSON / SARIF / Markdown output.
+
+**v2.0.0**: rebuilt on a typed, span-aware analyzer foundation with cross-step taint propagation (`StepOutputProvenance`), tree-sitter shell parsing, a real `${{ ... }}` expression parser, inline `# warden: ignore[WRD-XXX]` directives, and recalibrated rule severities. See [CHANGELOG.md](CHANGELOG.md).
 
 ## Install
 
@@ -46,12 +45,22 @@ Bare `./warden` (no args) launches an interactive guided menu in a TTY.
 Drop warden into any workflow:
 
 ```yaml
-- uses: projectwarden/warden@v1
+- uses: projectwarden/warden@a3c26c3f1897ddbe5c34cc3ce9ff4f14f84c83a8  # v2.0.0
   with:
     path: '.'
     fail-on: high        # critical | high | medium | low | none
     format: markdown     # console | json | sarif | markdown
 ```
+
+Don't write the workflow file by hand. Use `warden add-action` to generate a properly-pinned, properly-permissioned `.github/workflows/warden.yml` for you:
+
+```sh
+warden add-action --print              # print to stdout
+warden add-action                      # write to current repo
+warden add-action --pr myorg/myrepo --apply   # open a PR (returns a compare URL)
+```
+
+The generated workflow scans clean against warden's own ruleset (verified by an integration test on every build).
 
 ### Post a PR comment with findings
 
@@ -74,25 +83,25 @@ warden on every PR and posts a collapsible markdown summary as a comment:
 
 ## Auto-fix (plan / apply)
 
-`warden fix` runs in **plan mode by default** // it prints exactly what
+`warden fix` runs in **plan mode by default**: it prints exactly what
 would change without touching any file. This is the same model as
-`terraform plan` / `terraform apply`: the safe thing is the default and
+`terraform plan` / `terraform apply`: the safe thing is the default, and
 writes require explicit opt-in.
 
 ```sh
-# Plan // print fixable issues, no writes
+# Plan: print fixable issues, no writes
 warden fix .
 
-# Apply // actually rewrite files in place
+# Apply: actually rewrite files in place
 warden fix . --apply
 
-# Plan a PR // resolve fixes, but don't push or open anything
+# Plan a PR: resolve fixes but do not push or open anything
 warden fix . --pr owner/repo
 
-# Apply a PR // push a branch and return a compare URL (you click `Create pull request`)
+# Apply a PR: push a branch and return a compare URL (click `Create pull request`)
 GITHUB_TOKEN=ghp_... warden fix . --pr owner/repo --apply --prepare-only
 
-# Apply a PR // push branch AND open the PR for you
+# Apply a PR: push branch AND open the PR for you
 GITHUB_TOKEN=ghp_... warden fix . --pr owner/repo --apply
 ```
 
@@ -145,6 +154,20 @@ GitHub API quota is 60 req/hr, you will hit it on a real project.
 ```sh
 docker run --rm -v "$PWD":/repo ghcr.io/projectwarden/warden scan /repo
 ```
+
+## Architecture
+
+warden is a single-binary Rust crate (`wardenscan`), with a bin target at `src/main.rs` and a library surface at `src/lib.rs`. The pieces worth knowing:
+
+- `src/scanner/` loads `.github/workflows/*.yml` off disk (or off GitHub via `warden scan owner/repo`) and parses each file into a `LoadedWorkflow` carrying byte-exact span information.
+- `src/rules/` holds one source file per detection (`wrd101.rs`, `wrd110.rs`, ...). Each file defines a struct that implements the `Rule` trait declared in `src/rules/api.rs`.
+- `src/rules/api.rs` defines `AuditCtx`, the per-workflow context handed to every rule. It bundles the parsed workflow, a pre-built `ExprIndex` of `${{ ... }}` expressions, tree-sitter shell ASTs, an inline-ignore map, and the cross-step taint `StepOutputProvenance`.
+- `all_rules()` in `src/rules/api.rs` is the registry; the `tests/rule_meta_test.rs` suite asserts that every `src/rules/wrdNNN.rs` maps one-to-one to a registered rule with a matching `meta.id`.
+- `src/output/` lowers each `RuleFinding` to the plain `Finding` consumed by the console, JSON, SARIF, and Markdown formatters.
+
+Data flow: workflow YAML goes through `scanner::load_local` into a `LoadedWorkflow`, which is wrapped in an `AuditCtx` and handed to every rule returned by `all_rules()`; each rule yields `RuleFinding`s with byte-exact `Span`s, which are lowered via `RuleFinding::into_legacy` and serialized by one of the formatters in `src/output/` (JSON, SARIF, Markdown, or the default console renderer).
+
+The full rule catalog lives under [`docs/src/rules/`](docs/src/rules/), organized by attack class (`injection.md`, `triggers.md`, `supply-chain.md`, `permissions.md`, `ai-security.md`, `steganography.md`, `integrity.md`, `logic.md`).
 
 ## License
 

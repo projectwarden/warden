@@ -1,61 +1,86 @@
-use regex::Regex;
+use crate::models::Job;
+use crate::rules::{AuditCtx, Rule, RuleFinding, RuleMeta, Severity};
+use crate::yamlpath::Span;
 
-use crate::rules::{line_number_at_offset, Finding, Rule};
-use crate::scanner::Workflow;
-
-/// WRD-422: Debug logging enabled.
-/// Detects ACTIONS_RUNNER_DEBUG or ACTIONS_STEP_DEBUG set to true, which can
-/// expose secrets and sensitive data in logs.
 pub struct Wrd422;
 
-impl Rule for Wrd422 {
-    fn id(&self) -> &str {
-        "WRD-422"
-    }
-
-    fn name(&self) -> &str {
-        "Debug Logging Enabled"
-    }
-
-    fn severity(&self) -> &str {
-        "medium"
-    }
-
-    fn description(&self) -> &str {
-        "ACTIONS_RUNNER_DEBUG or ACTIONS_STEP_DEBUG is enabled. Debug logging \
-         can expose secrets and sensitive information in workflow logs."
-    }
-
-    fn check(&self, workflow: &Workflow) -> Vec<Finding> {
-        let mut findings = Vec::new();
-        let content = &workflow.content;
-
-        let debug_re = Regex::new(
-            r#"(?i)(ACTIONS_RUNNER_DEBUG|ACTIONS_STEP_DEBUG)\s*:\s*(?:true|'true'|"true")"#,
-        )
-        .unwrap();
-
-        for m in debug_re.captures_iter(content) {
-            let full = m.get(0).unwrap();
-            let var_name = m.get(1).unwrap().as_str();
-            let line = line_number_at_offset(content, full.start());
-            findings.push(Finding {
-                rule_id: self.id().to_string(),
-                severity: self.severity().to_string(),
-                title: format!("{var_name} is enabled"),
-                description: format!(
-                    "{var_name} is set to true. Debug mode logs additional information \
-                     that may include secrets, tokens, and other sensitive data."
-                ),
-                file: workflow.path.clone(),
-                line,
-                remediation: "Remove debug logging configuration or set it to false. \
-                              Use repository-level debug settings only when needed for \
-                              troubleshooting."
-                    .to_string(),
-            });
+fn debug_env_set(
+    env: &std::collections::BTreeMap<String, crate::models::EnvValue>,
+) -> Option<&'static str> {
+    for key in &["ACTIONS_RUNNER_DEBUG", "ACTIONS_STEP_DEBUG"] {
+        if let Some(v) = env.get(*key) {
+            let s = v.as_str_owned();
+            if s.eq_ignore_ascii_case("true") || s == "1" {
+                return Some(key);
+            }
         }
+    }
+    None
+}
 
+impl Rule for Wrd422 {
+    fn meta(&self) -> RuleMeta {
+        RuleMeta {
+            id: "WRD-422",
+            name: "Step/Runner Debug Enabled",
+            default_severity: Severity::Medium,
+            description: "ACTIONS_RUNNER_DEBUG or ACTIONS_STEP_DEBUG enabled in committed YAML \
+                          can expose secrets and sensitive data in workflow logs.",
+        }
+    }
+
+    fn audit(&self, ctx: &AuditCtx) -> Vec<RuleFinding> {
+        if ctx.loaded.is_stub {
+            return Vec::new();
+        }
+        let wf = &ctx.loaded.workflow;
+        let mut findings = Vec::new();
+        let mut emit = |path: &str, var: &str| {
+            let span = ctx
+                .loaded
+                .spans
+                .get_str(path)
+                .unwrap_or_else(|| Span::new(0, 0, 1, 1, 1, 1));
+            findings.push(RuleFinding {
+                rule_id: "WRD-422",
+                severity: Severity::Medium,
+                title: format!("{var} enabled in committed workflow"),
+                description: format!(
+                    "{var} causes the runner to print verbose diagnostic output, which can \
+                     include masked secrets in some scenarios. Enable on-demand via the \
+                     'Re-run with debug logging' UI button instead."
+                ),
+                primary: span,
+                related: Vec::new(),
+                remediation: format!("Remove {var} from the workflow file."),
+            });
+        };
+        if let Some(env) = &wf.env {
+            if let Some(var) = debug_env_set(env) {
+                emit("env", var);
+            }
+        }
+        for (job_name, job) in &wf.jobs {
+            if let Job::Normal(j) = job {
+                if let Some(env) = &j.env {
+                    if let Some(var) = debug_env_set(env) {
+                        emit(&format!("jobs.{job_name}.env"), var);
+                    }
+                }
+                for (i, step) in j.steps.iter().enumerate() {
+                    let env = match step {
+                        crate::models::Step::Run(r) => r.env.as_ref(),
+                        crate::models::Step::Uses(u) => u.env.as_ref(),
+                        crate::models::Step::Other(_) => None,
+                    };
+                    if let Some(env) = env {
+                        if let Some(var) = debug_env_set(env) {
+                            emit(&format!("jobs.{job_name}.steps[{i}].env"), var);
+                        }
+                    }
+                }
+            }
+        }
         findings
     }
 }

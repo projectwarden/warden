@@ -1,8 +1,8 @@
 [package]
 name = "wardenscan"
-version = "1.0.0"
+version = "2.0.0"
 edition = "2021"
-description = "CI/CD security scanner for GitHub Actions workflows"
+description = "GitHub Actions security scanner. 59 rules, auto-fixer, taint propagation."
 license = "MIT"
 repository = "https://github.com/projectwarden/warden"
 readme = "README.md"
@@ -13,11 +13,19 @@ categories = ["command-line-utilities", "development-tools"]
 name = "warden"
 path = "src/main.rs"
 
+[features]
+default = ["shell-analysis"]
+shell-analysis = ["dep:tree-sitter", "dep:tree-sitter-bash"]
+
 [dependencies]
 clap = { version = "4", features = ["derive", "env"] }
+tree-sitter = { version = "0.22", optional = true }
+tree-sitter-bash = { version = "0.21", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
+saphyr = "0.0.6"
+saphyr-parser = "0.0.6"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 colored = "2"

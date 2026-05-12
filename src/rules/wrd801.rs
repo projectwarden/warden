@@ -1,65 +1,78 @@
-use regex::Regex;
-use std::sync::OnceLock;
+use super::{AuditCtx, Rule, RuleFinding, RuleMeta, Severity};
+use crate::models::Job;
+use crate::yamlpath::Span;
 
-use super::{line_number_at_offset, Finding, Rule};
-use crate::scanner::Workflow;
+// ---------------------------------------------------------------------------
+// V2: typed lookup of the `on:` triggers and `runs-on:` per job.
+// ---------------------------------------------------------------------------
 
 pub struct Wrd801;
 
-fn re_pull_request_trigger() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?m)^\s*(pull_request|pull_request_target)\s*:").unwrap())
-}
-
-fn re_self_hosted() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"runs-on\s*:.*self-hosted").unwrap())
+fn runs_on_mentions_self_hosted(v: &serde_yaml::Value) -> bool {
+    match v {
+        serde_yaml::Value::String(s) => s.contains("self-hosted"),
+        serde_yaml::Value::Sequence(seq) => seq.iter().any(|x| {
+            x.as_str()
+                .map(|s| s.contains("self-hosted"))
+                .unwrap_or(false)
+        }),
+        _ => false,
+    }
 }
 
 impl Rule for Wrd801 {
-    fn id(&self) -> &str {
-        "WRD-801"
-    }
-    fn name(&self) -> &str {
-        "Self-Hosted Runner on PR"
-    }
-    fn severity(&self) -> &str {
-        "critical"
-    }
-    fn description(&self) -> &str {
-        "Detects pull_request triggers combined with self-hosted runners, \
-         allowing untrusted PR code to execute on your infrastructure"
+    fn meta(&self) -> RuleMeta {
+        RuleMeta {
+            id: "WRD-801",
+            name: "Self-Hosted Runner on PR",
+            default_severity: Severity::Critical,
+            description: "Detects pull_request triggers combined with self-hosted runners, \
+                          allowing untrusted PR code to execute on your infrastructure.",
+        }
     }
 
-    fn check(&self, workflow: &Workflow) -> Vec<Finding> {
+    fn audit(&self, ctx: &AuditCtx) -> Vec<RuleFinding> {
+        if ctx.loaded.is_stub {
+            return Vec::new();
+        }
+        let wf = &ctx.loaded.workflow;
+        let has_pr = wf.on.mentions("pull_request") || wf.on.mentions("pull_request_target");
+        if !has_pr {
+            return Vec::new();
+        }
+
         let mut findings = Vec::new();
-        let content = &workflow.content;
-
-        let has_pr_trigger = re_pull_request_trigger().is_match(content);
-        if !has_pr_trigger {
-            return findings;
+        for (job_name, job) in &wf.jobs {
+            if let Job::Normal(j) = job {
+                if let Some(runs_on) = &j.runs_on {
+                    if runs_on_mentions_self_hosted(runs_on) {
+                        let span = ctx
+                            .loaded
+                            .spans
+                            .get_str(&format!("jobs.{job_name}.runs-on"))
+                            .unwrap_or_else(|| Span::new(0, 0, 1, 1, 1, 1));
+                        findings.push(RuleFinding {
+                            rule_id: "WRD-801",
+                            severity: Severity::Critical,
+                            title: "Self-hosted runner used with pull_request trigger".into(),
+                            description: "Pull requests from forks can execute arbitrary code on \
+                                          self-hosted runners. Unlike GitHub-hosted runners, \
+                                          self-hosted runners are not ephemeral and may retain \
+                                          credentials, access internal networks, or persist \
+                                          malware between runs."
+                                .into(),
+                            primary: span,
+                            related: Vec::new(),
+                            remediation: "Use GitHub-hosted runners for PR workflows, or \
+                                          restrict self-hosted runner access using runner groups \
+                                          with repository policies. Consider using \
+                                          pull_request_target with explicit checkout controls."
+                                .into(),
+                        });
+                    }
+                }
+            }
         }
-
-        for m in re_self_hosted().find_iter(content) {
-            let line = line_number_at_offset(content, m.start());
-            findings.push(Finding {
-                rule_id: self.id().to_string(),
-                severity: self.severity().to_string(),
-                title: "Self-hosted runner used with pull_request trigger".to_string(),
-                description: "Pull requests from forks can execute arbitrary code on \
-                    self-hosted runners. Unlike GitHub-hosted runners, self-hosted runners \
-                    are not ephemeral and may retain credentials, access internal networks, \
-                    or persist malware between runs."
-                    .to_string(),
-                file: workflow.path.clone(),
-                line,
-                remediation: "Use GitHub-hosted runners for PR workflows, or restrict \
-                    self-hosted runner access using runner groups with repository policies. \
-                    Consider using pull_request_target with explicit checkout controls."
-                    .to_string(),
-            });
-        }
-
         findings
     }
 }

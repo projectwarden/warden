@@ -1,7 +1,8 @@
 use regex::Regex;
 
-use crate::rules::{line_number_at_offset, Finding, Rule};
-use crate::scanner::Workflow;
+use crate::models::{Job, Step};
+use crate::rules::{line_number_at_offset, AuditCtx, Rule, RuleFinding, RuleMeta, Severity};
+use crate::yamlpath::Span;
 
 /// WRD-511: MCP config injection.
 ///
@@ -17,13 +18,6 @@ use crate::scanner::Workflow;
 /// trigger contexts: `pull_request_target`, `workflow_run`, and
 /// `issue_comment`.
 ///
-/// Future enhancement (v1.1): if the .mcp.json already exists in main and the
-/// PR does not modify it, the marginal risk from the PR is lower (though the
-/// existing config may itself be compromised). Detecting this requires
-/// comparing against the base branch, which is outside the scope of warden's
-/// static workflow analysis.
-pub struct Wrd511;
-
 /// Verified MCP configuration file paths as of April 2026. Each entry links
 /// back to the upstream client's official documentation.
 const MCP_CONFIG_FILES: &[&str] = &[
@@ -57,107 +51,126 @@ const MCP_CONFIG_FILES: &[&str] = &[
     "cline_mcp_settings.json",
 ];
 
-impl Rule for Wrd511 {
-    fn id(&self) -> &str {
-        "WRD-511"
-    }
+// ---------------------------------------------------------------------------
+// V2: typed-model gating for triggers + checkout ref, raw-text scan for MCP
+// references and known MCP config file paths.
+// ---------------------------------------------------------------------------
 
-    fn name(&self) -> &str {
-        "MCP Config Injection"
-    }
+pub struct Wrd511;
 
-    fn severity(&self) -> &str {
-        "high"
-    }
+const PRIVILEGED_TRIGGERS_511: &[&str] = &["pull_request_target", "workflow_run", "issue_comment"];
 
-    fn description(&self) -> &str {
-        "Privileged-context workflow (pull_request_target, workflow_run, or \
-         issue_comment) checks out fork code that may contain malicious Model \
-         Context Protocol (MCP) server configurations (.mcp.json, .vscode/mcp.json, \
-         .cursor/mcp.json, .claude/mcp.json, .continue/mcpServers/, \
-         cline_mcp_settings.json, claude_desktop_config.json, etc.), enabling \
-         tool-server hijacking, secret exfiltration, and silent backdoor \
-         injection into AI-generated code."
-    }
+fn mentions_fork_head_511(ref_value: &str) -> bool {
+    let lower = ref_value.to_ascii_lowercase();
+    lower.contains("head.sha") || lower.contains("head_ref") || lower.contains("head.ref")
+}
 
-    fn check(&self, workflow: &Workflow) -> Vec<Finding> {
-        let mut findings = Vec::new();
-        let content = &workflow.content;
-
-        // Trigger gate: privileged contexts only.
-        let trigger_re =
-            Regex::new(r"(?i)\b(pull_request_target|workflow_run|issue_comment)\b").unwrap();
-        let Some(trigger_match) = trigger_re.find(content) else {
-            return findings;
+fn checkout_fork_step_511(wf: &crate::models::Workflow) -> bool {
+    for job in wf.jobs.values() {
+        let Job::Normal(j) = job else {
+            continue;
         };
+        for step in &j.steps {
+            if let Step::Uses(u) = step {
+                if !u.uses.starts_with("actions/checkout@") {
+                    continue;
+                }
+                if let Some(with) = &u.with {
+                    if let Some(ref_v) = with.get("ref") {
+                        if mentions_fork_head_511(&ref_v.as_str_owned()) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
+}
 
-        // Must check out fork-controlled PR head ref.
-        let checkout_head_re = Regex::new(
-            r"(?i)uses\s*:\s*actions/checkout@\S+[\s\S]*?ref\s*:\s*\$\{\{[^}]*?(?:head\.sha|head_ref|head\.ref)",
-        )
-        .unwrap();
-        if !checkout_head_re.is_match(content) {
+impl Rule for Wrd511 {
+    fn meta(&self) -> RuleMeta {
+        RuleMeta {
+            id: "WRD-511",
+            name: "MCP Config Injection",
+            default_severity: Severity::High,
+            description: "Privileged-context workflow (pull_request_target, workflow_run, or \
+                          issue_comment) checks out fork code that may contain malicious Model \
+                          Context Protocol (MCP) server configurations (.mcp.json, \
+                          .vscode/mcp.json, .cursor/mcp.json, .claude/mcp.json, \
+                          .continue/mcpServers/, cline_mcp_settings.json, \
+                          claude_desktop_config.json, etc.), enabling tool-server hijacking, \
+                          secret exfiltration, and silent backdoor injection into AI-generated \
+                          code.",
+        }
+    }
+
+    fn audit(&self, ctx: &AuditCtx) -> Vec<RuleFinding> {
+        if ctx.loaded.is_stub {
+            return Vec::new();
+        }
+        let wf = &ctx.loaded.workflow;
+        let mut findings = Vec::new();
+
+        let has_priv_trigger = PRIVILEGED_TRIGGERS_511.iter().any(|t| wf.on.mentions(t));
+        if !has_priv_trigger {
+            return findings;
+        }
+        if !checkout_fork_step_511(wf) {
             return findings;
         }
 
-        // Broad finding: any reference to MCP in a privileged + fork-checkout
-        // workflow is suspicious. We use a word-boundary match so unrelated
-        // tokens like "compose" don't false-positive.
+        let raw = &ctx.loaded.raw;
+
         let mcp_re = Regex::new(r"(?i)\bmcp\b").unwrap();
-        if let Some(m) = mcp_re.find(content) {
-            let line = line_number_at_offset(content, m.start());
-            findings.push(Finding {
-                rule_id: self.id().to_string(),
-                severity: self.severity().to_string(),
-                title: "MCP configuration in fork checkout".to_string(),
+        if let Some(m) = mcp_re.find(raw) {
+            let line = line_number_at_offset(raw, m.start());
+            let span = Span::new(m.start(), m.end(), line, 1, line, 1);
+            findings.push(RuleFinding {
+                rule_id: "WRD-511",
+                severity: Severity::High,
+                title: "MCP configuration in fork checkout".into(),
                 description: format!(
-                    "This privileged-context workflow checks out fork code and \
-                     references MCP. Across {} tracked MCP config file paths \
-                     (.mcp.json, .vscode/mcp.json, .cursor/mcp.json, \
-                     .claude/mcp.json, .continue/mcpServers/, cline_mcp_settings.json, \
-                     claude_desktop_config.json, ...) a fork PR could plant a \
-                     malicious server definition that redirects AI tool calls \
-                     to attacker infrastructure.",
+                    "This privileged-context workflow checks out fork code and references MCP. \
+                     Across {} tracked MCP config file paths (.mcp.json, .vscode/mcp.json, \
+                     .cursor/mcp.json, .claude/mcp.json, .continue/mcpServers/, \
+                     cline_mcp_settings.json, claude_desktop_config.json, ...) a fork PR could \
+                     plant a malicious server definition that redirects AI tool calls to \
+                     attacker infrastructure.",
                     MCP_CONFIG_FILES.len()
                 ),
-                file: workflow.path.clone(),
-                line,
-                remediation: "Do not process MCP configurations from untrusted \
-                              checkouts. Use a pinned, base-branch copy of any \
-                              required MCP config, or restore it via `git show \
-                              base:` before launching any AI tool that auto-loads \
-                              MCP servers from the working tree."
-                    .to_string(),
+                primary: span,
+                related: Vec::new(),
+                remediation: "Do not process MCP configurations from untrusted checkouts. Use \
+                              a pinned, base-branch copy of any required MCP config, or \
+                              restore it via `git show base:` before launching any AI tool \
+                              that auto-loads MCP servers from the working tree."
+                    .into(),
             });
-            // Note the trigger location too so the user knows which event made
-            // this risky in the first place.
-            let _ = trigger_match;
         }
 
-        // Specific finding: explicit MCP config file path referenced in YAML.
         for config_file in MCP_CONFIG_FILES {
-            if let Some(off) = content.find(config_file) {
-                let line = line_number_at_offset(content, off);
-                findings.push(Finding {
-                    rule_id: self.id().to_string(),
-                    severity: self.severity().to_string(),
+            if let Some(off) = raw.find(config_file) {
+                let line = line_number_at_offset(raw, off);
+                let span = Span::new(off, off + config_file.len(), line, 1, line, 1);
+                findings.push(RuleFinding {
+                    rule_id: "WRD-511",
+                    severity: Severity::High,
                     title: format!("MCP config file referenced: {config_file}"),
                     description: format!(
-                        "The workflow references '{config_file}' and runs in a \
-                         privileged context that checks out fork code. This MCP \
-                         config could be replaced by a malicious fork to hijack \
-                         AI tool servers, exfiltrate secrets passed through tool \
-                         calls, or inject backdoors into AI-generated code."
+                        "The workflow references '{config_file}' and runs in a privileged \
+                         context that checks out fork code. This MCP config could be replaced \
+                         by a malicious fork to hijack AI tool servers, exfiltrate secrets \
+                         passed through tool calls, or inject backdoors into AI-generated code."
                     ),
-                    file: workflow.path.clone(),
-                    line,
-                    remediation: "Avoid reading MCP config files from untrusted \
-                                  checkouts. Use a trusted copy from the base \
-                                  branch, or maintain MCP server definitions \
-                                  outside the repository entirely (e.g. \
-                                  ~/.codeium/windsurf/mcp_config.json or \
-                                  organization-managed config)."
-                        .to_string(),
+                    primary: span,
+                    related: Vec::new(),
+                    remediation: "Avoid reading MCP config files from untrusted checkouts. Use \
+                                  a trusted copy from the base branch, or maintain MCP server \
+                                  definitions outside the repository entirely (e.g. \
+                                  ~/.codeium/windsurf/mcp_config.json or organization-managed \
+                                  config)."
+                        .into(),
                 });
             }
         }

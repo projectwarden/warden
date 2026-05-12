@@ -89,7 +89,7 @@ jobs:
 
 ---
 
-## WRD-112: GITHUB_ENV/PATH Injection
+## WRD-112: GITHUB_ENV/PATH Write Sink
 
 **Severity:** High
 
@@ -136,9 +136,9 @@ jobs:
 
 ---
 
-## WRD-120: Step Output Injection
+## WRD-130: Step Output Read (Unknown Provenance)
 
-**Severity:** Medium
+**Severity:** Low
 
 **What it detects:** `steps.*.outputs.*` expressions interpolated in `run:` blocks. Step outputs may carry attacker-controlled data if a prior step set the output from tainted input.
 

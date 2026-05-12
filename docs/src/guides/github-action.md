@@ -2,6 +2,25 @@
 
 The warden GitHub Action runs workflow security scanning as part of your CI pipeline. It scans all workflows in the repository and optionally fails the build based on finding severity.
 
+## Quick add (recommended)
+
+Don't write the workflow file by hand. The CLI ships a `warden add-action` subcommand that generates a properly-pinned, properly-permissioned `.github/workflows/warden.yml` for you and either writes it locally or opens a PR against any repo:
+
+```sh
+# Print the workflow YAML to stdout (copy/paste into your CI setup)
+warden add-action --print
+
+# Write .github/workflows/warden.yml to the current repo
+warden add-action
+
+# Open a PR adding the workflow to a remote repo (returns a compare URL)
+GITHUB_TOKEN=ghp_... warden add-action --pr myorg/myrepo --apply
+```
+
+The generated file is SHA-pinned to specific versions of `actions/checkout` and `projectwarden/warden`, has an explicit `permissions: contents: read` block, an explicit `concurrency:` block, and uses `persist-credentials: false` on the checkout. Re-scanning it through warden itself reports zero findings, which is enforced by an integration test on every release build.
+
+You can also do this from the warden web dashboard at <https://wardenscan.tech/dashboard> if you'd rather click "Prepare add-action PR" and review the diff in the GitHub UI.
+
 ## Basic Usage
 
 ```yaml
@@ -19,7 +38,7 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
-      - uses: projectwarden/warden@v1
+      - uses: projectwarden/warden@a3c26c3f1897ddbe5c34cc3ce9ff4f14f84c83a8  # v2.0.0
         with:
           path: .github/workflows
 ```
@@ -43,19 +62,19 @@ jobs:
 Set `fail-on` to control which severity level causes the action to exit non-zero:
 
 ```yaml
-- uses: projectwarden/warden@v1
+- uses: projectwarden/warden@a3c26c3f1897ddbe5c34cc3ce9ff4f14f84c83a8  # v2.0.0
   with:
     fail-on: critical   # only fail on critical findings
 ```
 
 ```yaml
-- uses: projectwarden/warden@v1
+- uses: projectwarden/warden@a3c26c3f1897ddbe5c34cc3ce9ff4f14f84c83a8  # v2.0.0
   with:
     fail-on: medium     # fail on medium, high, and critical
 ```
 
 ```yaml
-- uses: projectwarden/warden@v1
+- uses: projectwarden/warden@a3c26c3f1897ddbe5c34cc3ce9ff4f14f84c83a8  # v2.0.0
   with:
     fail-on: none       # never fail (reporting only)
 ```
@@ -67,7 +86,7 @@ To upload results to GitHub Code Scanning, run warden a second time with
 can read:
 
 ```yaml
-- uses: projectwarden/warden@v1
+- uses: projectwarden/warden@a3c26c3f1897ddbe5c34cc3ce9ff4f14f84c83a8  # v2.0.0
   with:
     fail-on: none   # let Code Scanning handle enforcement
 
@@ -103,7 +122,7 @@ jobs:
       checks: write  # required for annotations
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
-      - uses: projectwarden/warden@v1
+      - uses: projectwarden/warden@a3c26c3f1897ddbe5c34cc3ce9ff4f14f84c83a8  # v2.0.0
         with:
           fail-on: high
 ```
@@ -132,10 +151,10 @@ Severity values must be one of `critical`, `high`, `medium`, or `low`.
 Always pin the warden action to a specific commit SHA:
 
 ```yaml
-- uses: projectwarden/warden@a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2  # v1.2.0
+- uses: projectwarden/warden@a3c26c3f1897ddbe5c34cc3ce9ff4f14f84c83a8  # v2.0.0
 ```
 
-Do not use `@main` or `@v1` (mutable tags). See [WRD-320](../rules/supply-chain.md#wrd-320-unpinned-actions).
+Do not use `@main` or `@v1` (mutable tags). See [WRD-311](../rules/supply-chain.md#wrd-311-unpinned-third-party-actions).
 
 ## Example: Full Security Gate Workflow
 
@@ -167,7 +186,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
       - name: Run warden (gate)
-        uses: projectwarden/warden@a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2  # v1.2.0
+        uses: projectwarden/warden@a3c26c3f1897ddbe5c34cc3ce9ff4f14f84c83a8  # v2.0.0
         with:
           path: .
           fail-on: high

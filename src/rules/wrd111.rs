@@ -1,70 +1,95 @@
-use regex::Regex;
+use crate::expression::PathSeg;
+use crate::rules::{AuditCtx, Rule, RuleFinding, RuleMeta, Severity};
+use crate::yamlpath::Span;
 
-use crate::rules::{line_number_at_offset, Finding, Rule};
-use crate::scanner::Workflow;
-
-/// WRD-111: Dispatch input injection.
-/// Detects workflow_dispatch inputs interpolated directly in run: blocks.
 pub struct Wrd111;
 
 impl Rule for Wrd111 {
-    fn id(&self) -> &str {
-        "WRD-111"
+    fn meta(&self) -> RuleMeta {
+        RuleMeta {
+            id: "WRD-111",
+            name: "Untrusted Input Injection",
+            default_severity: Severity::High,
+            description: "workflow_dispatch, repository_dispatch, or workflow_call inputs \
+                          interpolated in run: blocks can be controlled by an external caller \
+                          (push user, dispatch API client, or upstream workflow) and injected \
+                          into the shell.",
+        }
     }
 
-    fn name(&self) -> &str {
-        "Dispatch Input Injection"
-    }
-
-    fn severity(&self) -> &str {
-        "high"
-    }
-
-    fn description(&self) -> &str {
-        "workflow_dispatch or repository_dispatch inputs interpolated in run: blocks \
-         can be controlled by any user with push access, enabling command injection."
-    }
-
-    fn check(&self, workflow: &Workflow) -> Vec<Finding> {
-        let mut findings = Vec::new();
-        let content = &workflow.content;
-
-        // Check if workflow uses workflow_dispatch or repository_dispatch
-        let has_dispatch = Regex::new(r"(?i)workflow_dispatch|repository_dispatch").unwrap();
-        if !has_dispatch.is_match(content) {
-            return findings;
+    fn audit(&self, ctx: &AuditCtx) -> Vec<RuleFinding> {
+        if ctx.loaded.is_stub {
+            return Vec::new();
+        }
+        let on = &ctx.loaded.workflow.on;
+        // workflow_call callees read caller-supplied inputs.* in their run
+        // blocks; although the caller is another workflow rather than a push
+        // user, the input is still externally controlled from the callee's
+        // point of view and produces the same injection surface. The fixer
+        // (fix_expression_injection) already rewrites these, so suppressing
+        // the finding here would cause the "fixes proposed / no findings"
+        // parity drift that tripped the 2026-04-23 audit.
+        if !on.mentions("workflow_dispatch")
+            && !on.mentions("repository_dispatch")
+            && !on.mentions("workflow_call")
+        {
+            return Vec::new();
         }
 
-        let run_block_re =
-            Regex::new(r"(?i)\brun\s*:\s*[|>]?[ \t]*\n?([\s\S]*?)(?:\n\s*\w+:|$)").unwrap();
-        let dispatch_input_re =
-            Regex::new(r"\$\{\{\s*(?:github\.event\.inputs\.\w+|inputs\.\w+)").unwrap();
+        // Source label for the finding title so the caller sees which
+        // trigger family applies; helps triage in multi-trigger workflows.
+        let source = if on.mentions("workflow_call") {
+            "workflow_call"
+        } else if on.mentions("workflow_dispatch") {
+            "workflow_dispatch"
+        } else {
+            "repository_dispatch"
+        };
 
-        for cap in run_block_re.captures_iter(content) {
-            let full = cap.get(0).unwrap();
-            let block_text = full.as_str();
-            let block_start = full.start();
-
-            for m in dispatch_input_re.find_iter(block_text) {
-                let line = line_number_at_offset(content, block_start + m.start());
-                findings.push(Finding {
-                    rule_id: self.id().to_string(),
-                    severity: self.severity().to_string(),
-                    title: "Dispatch input injection".to_string(),
-                    description: format!(
-                        "Expression '{}' is interpolated in a run: block. \
-                         Dispatch inputs are user-controlled and can inject commands.",
-                        m.as_str()
-                    ),
-                    file: workflow.path.clone(),
-                    line,
-                    remediation: "Pass dispatch inputs through environment variables instead of \
-                                  direct interpolation."
-                        .to_string(),
-                });
+        let mut findings = Vec::new();
+        for occ in ctx.expressions.occurrences() {
+            if !occ.path.ends_with(".run") {
+                continue;
+            }
+            let Some(ast) = occ.ast.as_ref() else {
+                continue;
+            };
+            for path in ast.all_paths() {
+                if matches!(path.first(), Some(PathSeg::Root(r)) if r == "inputs") {
+                    let field_span = ctx
+                        .loaded
+                        .spans
+                        .get_str(&occ.path)
+                        .unwrap_or_else(|| Span::new(0, 0, 1, 1, 1, 1));
+                    let actual_line = field_span.start_line + occ.line_offset_in_field;
+                    let span = Span::new(
+                        field_span.byte_start,
+                        field_span.byte_end,
+                        actual_line,
+                        field_span.start_col,
+                        actual_line,
+                        field_span.end_col,
+                    );
+                    findings.push(RuleFinding {
+                        rule_id: "WRD-111",
+                        severity: Severity::High,
+                        title: format!("{source} input interpolated in run: block"),
+                        description: format!(
+                            "An `inputs.*` value from {source} is read inside a run: block. \
+                             Externally-supplied inputs interpolated into the shell can be \
+                             crafted to inject arbitrary commands."
+                        ),
+                        primary: span,
+                        related: Vec::new(),
+                        remediation: "Pass inputs through an `env:` mapping and reference \
+                                      the environment variable inside the script instead of \
+                                      `${{ inputs.* }}` directly."
+                            .into(),
+                    });
+                    break;
+                }
             }
         }
-
         findings
     }
 }

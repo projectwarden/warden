@@ -4,29 +4,7 @@ These rules detect patterns where secrets or sensitive credentials are exposed t
 
 ---
 
-## WRD-420: Secrets in Run Blocks
-
-**Severity:** Medium
-
-**What it detects:** `${{ secrets.* }}` expressions interpolated directly in `run:` blocks instead of being passed through environment variables. Secrets in shell commands can leak through process listings, shell history, and error messages.
-
-**Vulnerable:**
-
-```yaml
-- run: curl -H "Authorization: Bearer ${{ secrets.API_KEY }}" https://api.example.com
-```
-
-**Remediation:** Pass secrets through step-level environment variables.
-
-```yaml
-- env:
-    API_KEY: ${{ secrets.API_KEY }}
-  run: curl -H "Authorization: Bearer $API_KEY" https://api.example.com
-```
-
----
-
-## WRD-421: Network Exfiltration Risk
+## WRD-421: Network Call Touches Secret
 
 **Severity:** Medium
 
@@ -45,7 +23,7 @@ These rules detect patterns where secrets or sensitive credentials are exposed t
 
 ---
 
-## WRD-422: Debug Logging Enabled
+## WRD-422: Step/Runner Debug Enabled
 
 **Severity:** Medium
 
@@ -62,7 +40,7 @@ env:
 
 ---
 
-## WRD-424: Secrets Used Outside Environment Scope
+## WRD-424: Secrets Used Without Environment Gate
 
 **Severity:** Medium
 
@@ -103,4 +81,26 @@ jobs:
         env:
           PYPI_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
         run: twine upload --username __token__ --password "$PYPI_TOKEN" dist/*
+```
+
+---
+
+## WRD-440: Secret Reference Inventory
+
+**Severity:** Info
+
+**What it detects:** `${{ secrets.* }}` expressions interpolated directly in `run:` blocks instead of being passed through environment variables. Secrets in shell commands can leak through process listings, shell history, and error messages. This is an informational hygiene signal that surfaces every direct shell-context secret reference so reviewers can audit them.
+
+**Vulnerable:**
+
+```yaml
+- run: curl -H "Authorization: Bearer ${{ secrets.API_KEY }}" https://api.example.com
+```
+
+**Remediation:** Pass secrets through step-level environment variables.
+
+```yaml
+- env:
+    API_KEY: ${{ secrets.API_KEY }}
+  run: curl -H "Authorization: Bearer $API_KEY" https://api.example.com
 ```

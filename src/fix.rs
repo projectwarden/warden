@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 
 use anyhow::{bail, Context, Result};
@@ -26,8 +26,9 @@ pub struct FixResult {
     pub fixes: Vec<FixRecord>,
 }
 
-/// Build a GitHub API client with optional token.
-fn build_client(token: Option<&str>) -> Result<Client> {
+/// Build a GitHub API client with optional token. Shared with `add_action`
+/// (and any future module that needs to talk to the GitHub REST API).
+pub(crate) fn build_client(token: Option<&str>) -> Result<Client> {
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert(
         USER_AGENT,
@@ -54,16 +55,16 @@ fn build_client(token: Option<&str>) -> Result<Client> {
 }
 
 #[derive(Deserialize)]
-struct GitRef {
-    object: GitObject,
+pub(crate) struct GitRef {
+    pub object: GitObject,
 }
 
 #[derive(Deserialize)]
-struct GitObject {
-    sha: String,
+pub(crate) struct GitObject {
+    pub sha: String,
     #[serde(rename = "type")]
-    obj_type: String,
-    url: Option<String>,
+    pub obj_type: String,
+    pub url: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -104,13 +105,80 @@ fn resolve_tag_to_sha(client: &Client, owner: &str, repo: &str, tag: &str) -> Op
     Some(git_ref.object.sha)
 }
 
+/// Ensure the string ends with exactly one newline. POSIX text files
+/// must end with `\n` ("a sequence of zero or more lines, each terminated
+/// by a newline"). Many tools rely on this: `wc -l` undercounts files
+/// without it, `cat` concatenation loses file boundaries, git renders
+/// "\ No newline at end of file" in diffs, GitHub shows the red dot
+/// indicator on the affected line in PRs, and some POSIX shells skip
+/// the last line of a script entirely if it's missing the terminator.
+/// We always normalize this whenever a fixer rewrites file contents,
+/// so even files that arrived without a trailing newline get fixed
+/// for free as a side effect of any other auto-fix.
+fn ensure_trailing_newline(mut s: String) -> String {
+    if !s.ends_with('\n') {
+        s.push('\n');
+    }
+    s
+}
+
 /// Apply all fixes to a single workflow, returning the fixed content and a list of changes.
+///
+/// Callers that process many workflows in a single invocation should prefer
+/// [`fix_workflow_cached`] with a shared SHA cache; otherwise every workflow
+/// pays the full cost of resolving `actions/checkout@v6`-style tags against
+/// the GitHub API, even though hundreds of workflows across a repo typically
+/// reference the same tagged dependencies.
 pub fn fix_workflow(workflow: &Workflow, github_token: Option<&str>) -> FixResult {
+    let mut cache: HashMap<String, Option<String>> = HashMap::new();
+    fix_workflow_cached(workflow, github_token, &mut cache)
+}
+
+/// Apply all fixes to a single workflow, reusing `sha_cache` across calls.
+///
+/// The cache key is `"<owner>/<repo>@<tag>"`; one resolved SHA lookup is
+/// worth reusing across every workflow in the same repo (and sometimes
+/// across a whole `warden fix` invocation that spans multiple repos, when
+/// several repos pin the same popular action tag). Each cache hit saves
+/// one GitHub API round trip.
+pub fn fix_workflow_cached(
+    workflow: &Workflow,
+    github_token: Option<&str>,
+    sha_cache: &mut HashMap<String, Option<String>>,
+) -> FixResult {
     let mut content = workflow.content.clone();
     let mut fixes = Vec::new();
 
+    // Parity guard with scanner. Every rule that walks `workflow.jobs`
+    // bails when the typed parse downgrades a file to a stub; the
+    // fixer's text-based passes used to keep firing regardless, so a
+    // single YAML-shape we hadn't taught the typed model would emit
+    // "11 proposed fixes / 2 findings" UI inconsistencies. Detect the
+    // stub case here once and short-circuit every pass.
+    if crate::scanner::load_one(
+        std::path::PathBuf::from(&workflow.path),
+        workflow.content.clone(),
+    )
+    .ok()
+    .map(|lf| matches!(lf, crate::scanner::LoadedFile::Other { .. }))
+    .unwrap_or(false)
+    {
+        return FixResult {
+            path: workflow.path.clone(),
+            original: workflow.content.clone(),
+            fixed: workflow.content.clone(),
+            fixes,
+        };
+    }
+
     // Pass 1: Pin unpinned actions to SHA
-    content = fix_unpin_actions(&content, github_token, &workflow.path, &mut fixes);
+    content = fix_unpin_actions(
+        &content,
+        github_token,
+        &workflow.path,
+        &mut fixes,
+        sha_cache,
+    );
 
     // Pass 2: Extract expressions from run blocks to env vars
     content = fix_expression_injection(&content, &workflow.path, &mut fixes);
@@ -124,13 +192,13 @@ pub fn fix_workflow(workflow: &Workflow, github_token: Option<&str>) -> FixResul
         fixes.push(rec);
     }
 
-    // Pass 5: Add documentation comment above permissions: block (WRD-826)
-    if let Some((new_content, rec)) = fix_permissions_comment(&content, &workflow.path) {
+    // Pass 5: Add inline documentation comment to each permission entry (WRD-840)
+    if let Some((new_content, recs)) = fix_permission_entry_comments(&content, &workflow.path) {
         content = new_content;
-        fixes.push(rec);
+        fixes.extend(recs);
     }
 
-    // Pass 6: Add concurrency: block if missing (WRD-831)
+    // Pass 6: Add concurrency: block if missing (WRD-842)
     if let Some((new_content, rec)) = fix_missing_concurrency(&content, &workflow.path) {
         content = new_content;
         fixes.push(rec);
@@ -145,19 +213,22 @@ pub fn fix_workflow(workflow: &Workflow, github_token: Option<&str>) -> FixResul
 }
 
 /// Pin action references like `uses: owner/repo@v1` to their commit SHA.
+///
+/// `sha_cache` is shared across every workflow in a single `warden fix`
+/// run so repeated references to the same tag (e.g. `actions/checkout@v6`
+/// appearing in 12 workflows) only pay one GitHub API round trip.
 fn fix_unpin_actions(
     content: &str,
     token: Option<&str>,
     file: &str,
     fixes: &mut Vec<FixRecord>,
+    sha_cache: &mut HashMap<String, Option<String>>,
 ) -> String {
     let re =
         Regex::new(r"(?m)^(\s*uses:\s*)([a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+)@(v[a-zA-Z0-9._-]+)\s*$")
             .unwrap();
 
     let client = build_client(token).ok();
-    // Cache resolved SHAs so we don't hit the API repeatedly for the same action
-    let mut sha_cache: HashMap<String, Option<String>> = HashMap::new();
 
     let lines: Vec<&str> = content.lines().collect();
     let mut result_lines: Vec<String> = Vec::new();
@@ -204,15 +275,134 @@ fn fix_unpin_actions(
         result_lines.push(line.to_string());
     }
 
-    result_lines.join("\n")
+    ensure_trailing_newline(result_lines.join("\n"))
+}
+
+/// Resolve every unique (action, tag) pair across `workflows` in parallel
+/// and fill `sha_cache` with the results before the serial fix passes run.
+///
+/// The old flow resolved SHAs lazily, one per match site, in line-order.
+/// A repo with ten unique unpinned actions paid ten serial ~300 ms
+/// GitHub API round trips (~3 s of wall time) before the first fix pass
+/// even started emitting. Prewarming in parallel collapses that to a
+/// single round trip's worth of time; subsequent lookups from
+/// `fix_unpin_actions` are pure cache hits.
+///
+/// Silently no-ops when the HTTP client cannot be built (e.g. offline,
+/// no token and the rate limiter stubs us out). Subsequent fixes then
+/// fall through to the existing per-line path, which already tolerates
+/// `None` from resolution.
+fn prewarm_sha_cache(
+    workflows: &[Workflow],
+    token: Option<&str>,
+    sha_cache: &mut HashMap<String, Option<String>>,
+) {
+    let re =
+        Regex::new(r"(?m)^\s*uses:\s*([a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+)@(v[a-zA-Z0-9._-]+)\s*$")
+            .unwrap();
+
+    let mut unique: HashSet<(String, String)> = HashSet::new();
+    for w in workflows {
+        for caps in re.captures_iter(&w.content) {
+            let action = caps.get(1).unwrap().as_str().to_string();
+            let tag = caps.get(2).unwrap().as_str().to_string();
+            let key = format!("{action}@{tag}");
+            if !sha_cache.contains_key(&key) {
+                unique.insert((action, tag));
+            }
+        }
+    }
+
+    if unique.is_empty() {
+        return;
+    }
+
+    let client = match build_client(token) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+
+    let to_resolve: Vec<(String, String)> = unique.into_iter().collect();
+    let resolved: Vec<(String, Option<String>)> = std::thread::scope(|s| {
+        let client_ref = &client;
+        let handles: Vec<_> = to_resolve
+            .iter()
+            .map(|(action, tag)| {
+                let action = action.clone();
+                let tag = tag.clone();
+                s.spawn(move || {
+                    let sha = match action.split_once('/') {
+                        Some((owner, repo)) => resolve_tag_to_sha(client_ref, owner, repo, &tag),
+                        None => None,
+                    };
+                    (format!("{action}@{tag}"), sha)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap_or_else(|_| (String::new(), None)))
+            .collect()
+    });
+
+    for (key, sha) in resolved {
+        if !key.is_empty() {
+            sha_cache.insert(key, sha);
+        }
+    }
+}
+
+/// True if the captured expression path is one the WRD-101 family treats as
+/// attacker-controlled. The fixer must agree with the scanner here: if we
+/// rewrite an expression that no rule flagged, the resulting fix-PR has
+/// surprise extras the user can't trace back to a finding.
+///
+/// `github.event.*` paths are tightly checked against the canonical
+/// TAINTED_EXPRESSIONS list (the same one wrd101 uses), so safe paths like
+/// `github.event.repository.name` are NOT rewritten.
+///
+/// `inputs.*` is treated as always-tainted because the rules that flag it
+/// (WRD-110 composite, WRD-111 dispatch, WRD-113 reusable workflow_call) all
+/// fire whenever inputs.* appears in a run block in their respective context.
+/// A regular push workflow with `${{ inputs.X }}` in a run is invalid YAML
+/// at runtime anyway (inputs is empty), so the rewrite is harmless.
+fn is_taintable_expression(inner: &str) -> bool {
+    if let Some(rest) = inner.strip_prefix("github.event.") {
+        for tainted in crate::rules::wrd101::TAINTED_EXPRESSIONS {
+            // Strip the `github.event.` prefix from the tainted pattern (every
+            // entry on the canonical list starts with that, except `github.head_ref`).
+            let Some(t_rest) = tainted.strip_prefix("github.event.") else {
+                continue;
+            };
+            // Match at dot boundaries: `issue.title` matches `issue.title`
+            // and `issue.title.foo` (deeper paths under a tainted root), but
+            // NOT `issue.title_other`.
+            if rest == t_rest || rest.starts_with(&format!("{t_rest}.")) {
+                return true;
+            }
+        }
+        return false;
+    }
+    if inner == "github.head_ref" {
+        return true;
+    }
+    if inner.starts_with("inputs.") {
+        return true;
+    }
+    false
 }
 
 /// Extract dangerous expressions from `run:` blocks into `env:` mappings.
+/// Only rewrites expressions that `is_taintable_expression` accepts, so the
+/// fixer matches the WRD-101 / WRD-110 / WRD-111 / WRD-113 / WRD-130 family
+/// 1:1 and never produces surprise extras in `warden fix --pr` output.
 fn fix_expression_injection(content: &str, file: &str, fixes: &mut Vec<FixRecord>) -> String {
-    // Match expressions that could be injection vectors
-    let expr_re =
-        Regex::new(r"\$\{\{\s*(github\.event\.[a-zA-Z0-9_.]+|inputs\.[a-zA-Z0-9_.]+)\s*\}\}")
-            .unwrap();
+    // Match candidate expressions. The membership check below filters out
+    // any path the WRD-101 family wouldn't actually flag.
+    let expr_re = Regex::new(
+        r"\$\{\{\s*(github\.event\.[a-zA-Z0-9_.]+|github\.head_ref|inputs\.[a-zA-Z0-9_.]+)\s*\}\}",
+    )
+    .unwrap();
     // Match a `- run:` line (single-line run value on the same line)
     let run_line_re = Regex::new(r"^(\s*-?\s*run:\s*)(.+)$").unwrap();
 
@@ -264,6 +454,12 @@ fn fix_expression_injection(content: &str, file: &str, fixes: &mut Vec<FixRecord
                             .map(|m| m.as_str().to_string())
                             .unwrap_or_default();
 
+                        // Skip safe `github.event.*` paths that the scanner
+                        // would not have flagged (e.g. `repository.name`).
+                        if !is_taintable_expression(&inner) {
+                            continue;
+                        }
+
                         let var_name = expression_to_var_name(&inner);
                         if !env_vars.iter().any(|(_, e)| e == full_expr) {
                             env_vars.push((var_name.clone(), full_expr.to_string()));
@@ -314,13 +510,18 @@ fn fix_expression_injection(content: &str, file: &str, fixes: &mut Vec<FixRecord
                 continue;
             }
 
-            // Single-line run: value
+            // Single-line run: value. Same membership filter as the block
+            // scalar branch above so safe `github.event.*` paths are skipped.
             let exprs: Vec<(String, String)> = expr_re
                 .captures_iter(run_body)
-                .map(|c| {
+                .filter_map(|c| {
                     let full = c.get(0).unwrap().as_str().to_string();
                     let inner = c.get(1).unwrap().as_str().to_string();
-                    (full, inner)
+                    if is_taintable_expression(&inner) {
+                        Some((full, inner))
+                    } else {
+                        None
+                    }
                 })
                 .collect();
 
@@ -367,7 +568,7 @@ fn fix_expression_injection(content: &str, file: &str, fixes: &mut Vec<FixRecord
         i += 1;
     }
 
-    result_lines.join("\n")
+    ensure_trailing_newline(result_lines.join("\n"))
 }
 
 /// Add `persist-credentials: false` to checkout steps that lack it.
@@ -388,24 +589,41 @@ fn fix_checkout_persist_credentials(
         result_lines.push(line.to_string());
 
         if checkout_re.is_match(line) {
-            // Determine indentation for the `with:` block
-            let leading = line.len() - line.trim_start().len();
-            // Check if there's already a `with:` block following
-            let with_indent = leading + 2; // typical step property indent
-            let inner_indent = with_indent + 2;
+            // Find where `uses:` itself starts on the line. For
+            //     "        uses: actions/checkout@..."
+            // this is the line indent (e.g. col 8). For the compact list
+            // form
+            //     "      - uses: actions/checkout@..."
+            // it's 2 more than the line indent (col 8) because the `- `
+            // prefix consumes 2 columns. Sibling step properties
+            // (`with:`, `env:`, `if:`, ...) all align with `uses:` itself,
+            // not with the leading `-`. Computing `leading` from the line
+            // indent alone produced wrong values for the compact form.
+            let leading = line
+                .find("uses:")
+                .unwrap_or_else(|| line.len() - line.trim_start().len());
+            let with_indent = leading;
+            let inner_indent = leading + 2;
 
             // Look ahead: does persist-credentials already exist in this step?
             let mut has_persist = false;
             let mut has_with = false;
             let mut j = i + 1;
 
-            // Scan the rest of this step
+            // Scan the rest of this step. We exit when we leave the step's
+            // scope -- which means a non-blank line at indent strictly less
+            // than `leading` (next step's `- name:`, next job, or top-level
+            // key). Lines at the same indent as `leading` are SIBLING step
+            // properties and we want to keep scanning into them. The
+            // previous `<= leading` break terminated as soon as it saw the
+            // existing `with:` line at the same indent as `uses:`, which
+            // left has_with=false and made the fallback branch insert a
+            // duplicate `with:` block at the wrong indent.
             while j < lines.len() {
                 let next = lines[j].trim();
-                // If we hit another step or a job-level key, stop
                 if !next.is_empty() {
                     let next_indent = lines[j].len() - lines[j].trim_start().len();
-                    if next_indent <= leading && (next.starts_with('-') || !next.starts_with('#')) {
+                    if next_indent < leading {
                         break;
                     }
                 }
@@ -461,7 +679,7 @@ fn fix_checkout_persist_credentials(
         i += 1;
     }
 
-    result_lines.join("\n")
+    ensure_trailing_newline(result_lines.join("\n"))
 }
 
 /// Convert a GitHub Actions expression path to a screaming snake case env var name.
@@ -563,17 +781,11 @@ fn fix_missing_permissions(content: &str, file: &str) -> Option<(String, FixReco
     let lines: Vec<&str> = content.lines().collect();
     let insert_at = find_end_of_on_block(&lines)?;
 
-    let trailing_newline = content.ends_with('\n');
     let mut new_lines: Vec<String> = lines.iter().map(|s| s.to_string()).collect();
     new_lines.insert(insert_at, "permissions: read-all".to_string());
 
-    let mut out = new_lines.join("\n");
-    if trailing_newline {
-        out.push('\n');
-    }
-
     Some((
-        out,
+        ensure_trailing_newline(new_lines.join("\n")),
         FixRecord {
             file: file.to_string(),
             line: insert_at + 1,
@@ -582,46 +794,115 @@ fn fix_missing_permissions(content: &str, file: &str) -> Option<(String, FixReco
     ))
 }
 
-/// WRD-826: Insert a documentation comment above a top-level `permissions:` line if none.
-fn fix_permissions_comment(content: &str, file: &str) -> Option<(String, FixRecord)> {
-    let lines: Vec<&str> = content.lines().collect();
-    let perm_idx = lines.iter().position(|l| {
-        let t = l.trim_start();
-        l.len() == t.len() && (t == "permissions:" || t.starts_with("permissions:"))
-    })?;
-
-    // Skip if previous non-blank line is a comment
-    if perm_idx > 0 {
-        let prev = lines[perm_idx - 1].trim_start();
-        if prev.starts_with('#') {
-            return None;
+/// Default explanation for a (permission, level) pair, used by the WRD-840
+/// per-entry comment fixer below. The wording mirrors what GitHub's own
+/// permissions docs use, so reviewers reading the diff aren't surprised.
+fn default_permission_explanation(perm: &str, level: &str) -> &'static str {
+    match (perm, level) {
+        ("contents", "read") => "required to read repository contents",
+        ("contents", "write") => "required to push commits, branches, or releases",
+        ("contents", "none") => "explicitly denying contents access",
+        ("packages", "read") => "required to pull container images / packages from GHCR",
+        ("packages", "write") => "required to push container images / packages to GHCR",
+        ("actions", "read") => "required to read workflow runs / artifacts",
+        ("actions", "write") => "required to dispatch workflows or modify workflow runs",
+        ("deployments", "read") => "required to read deployment status",
+        ("deployments", "write") => "required to create deployments",
+        ("id-token", "read") => "required to read OIDC tokens",
+        ("id-token", "write") => {
+            "required for OIDC token exchange (cloud auth, sigstore, attestations)"
         }
+        ("issues", "read") => "required to read issues",
+        ("issues", "write") => "required to create or comment on issues",
+        ("pull-requests", "read") => "required to read pull requests",
+        ("pull-requests", "write") => "required to create, comment on, or modify pull requests",
+        ("statuses", "read") => "required to read commit statuses",
+        ("statuses", "write") => "required to set commit statuses",
+        ("security-events", "read") => "required to read code scanning alerts",
+        ("security-events", "write") => "required to upload SARIF reports / code scanning results",
+        ("checks", "read") => "required to read check runs",
+        ("checks", "write") => "required to create or update check runs",
+        ("pages", "read") => "required to read GitHub Pages config",
+        ("pages", "write") => "required to deploy to GitHub Pages",
+        ("discussions", "read") => "required to read discussions",
+        ("discussions", "write") => "required to create or comment on discussions",
+        ("repository-projects", "read") => "required to read repository projects",
+        ("repository-projects", "write") => "required to modify repository projects",
+        ("attestations", "read") => "required to read attestations",
+        ("attestations", "write") => "required to write attestations",
+        _ => "required for this workflow",
     }
-
-    let comment = "# Permissions are scoped to least privilege. See https://docs.github.com/en/actions/using-jobs/assigning-permissions-to-jobs";
-
-    let trailing_newline = content.ends_with('\n');
-    let mut new_lines: Vec<String> = lines.iter().map(|s| s.to_string()).collect();
-    new_lines.insert(perm_idx, comment.to_string());
-
-    let mut out = new_lines.join("\n");
-    if trailing_newline {
-        out.push('\n');
-    }
-
-    Some((
-        out,
-        FixRecord {
-            file: file.to_string(),
-            line: perm_idx + 1,
-            description: "Added documentation comment above permissions: block".to_string(),
-        },
-    ))
 }
 
-/// WRD-831: Insert a top-level `concurrency:` block if none exists anywhere.
+/// WRD-840: Add an inline `# explanation` comment to every permission entry
+/// that lacks one. Walks every `<perm>: <level>` line under any `permissions:`
+/// block (top-level or per-job) and appends a default explanation if neither
+/// the line itself nor the line above already has a `#` comment. Returns one
+/// FixRecord per modified entry so the count matches the number of WRD-840
+/// findings the rule produced. The previous version of this fixer added a
+/// single block-level comment, which counted as 1 fix but did not actually
+/// satisfy WRD-840's per-entry check, leaving stale findings on the next scan.
+fn fix_permission_entry_comments(content: &str, file: &str) -> Option<(String, Vec<FixRecord>)> {
+    let entry_re = Regex::new(
+        r"^(\s+)(contents|packages|actions|deployments|id-token|issues|pull-requests|statuses|security-events|checks|pages|discussions|repository-projects|attestations)(\s*:\s*)(read|write|none)\s*$",
+    )
+    .unwrap();
+
+    let lines: Vec<&str> = content.lines().collect();
+    let mut new_lines: Vec<String> = lines.iter().map(|s| s.to_string()).collect();
+    let mut records: Vec<FixRecord> = Vec::new();
+
+    for (idx, line) in lines.iter().enumerate() {
+        let Some(caps) = entry_re.captures(line) else {
+            continue;
+        };
+        // Skip if the line already has any inline `#` (the regex enforces no
+        // trailing comment so this should never trigger, but defense in depth)
+        if line.contains('#') {
+            continue;
+        }
+        // Skip if the previous line is already a `# ...` comment
+        if idx > 0 && lines[idx - 1].trim_start().starts_with('#') {
+            continue;
+        }
+
+        let leading = caps.get(1).unwrap().as_str();
+        let perm = caps.get(2).unwrap().as_str();
+        let level = caps.get(4).unwrap().as_str();
+        let explanation = default_permission_explanation(perm, level);
+
+        new_lines[idx] = format!("{leading}{perm}: {level}  # {explanation}");
+
+        records.push(FixRecord {
+            file: file.to_string(),
+            line: idx + 1,
+            description: format!("Documented `{perm}: {level}` permission entry"),
+        });
+    }
+
+    if records.is_empty() {
+        return None;
+    }
+
+    Some((ensure_trailing_newline(new_lines.join("\n")), records))
+}
+
+/// WRD-842: Insert a top-level `concurrency:` block if none exists anywhere.
+///
+/// Only fires when the workflow is triggered by `push` or `pull_request`,
+/// matching what WRD-842's scanner-side check requires. A
+/// `workflow_dispatch`-only or `schedule`-only workflow does not get a
+/// concurrency block from this fixer because the rule wouldn't have flagged
+/// it, and adding one would be a surprise extra in the fix-PR.
 fn fix_missing_concurrency(content: &str, file: &str) -> Option<(String, FixRecord)> {
     if has_any_key(content, "concurrency") {
+        return None;
+    }
+
+    // Match WRD-842's `^\s*(push|pull_request)\s*:` regex exactly so the
+    // scanner and fixer fire on the same set of workflows.
+    let trigger_re = Regex::new(r"(?m)^\s*(push|pull_request)\s*:").unwrap();
+    if !trigger_re.is_match(content) {
         return None;
     }
 
@@ -662,19 +943,13 @@ fn fix_missing_concurrency(content: &str, file: &str) -> Option<(String, FixReco
         "  cancel-in-progress: true".to_string(),
     ];
 
-    let trailing_newline = content.ends_with('\n');
     let mut new_lines: Vec<String> = lines.iter().map(|s| s.to_string()).collect();
     for (offset, bl) in block.into_iter().enumerate() {
         new_lines.insert(insert_at + offset, bl);
     }
 
-    let mut out = new_lines.join("\n");
-    if trailing_newline {
-        out.push('\n');
-    }
-
     Some((
-        out,
+        ensure_trailing_newline(new_lines.join("\n")),
         FixRecord {
             file: file.to_string(),
             line: insert_at + 1,
@@ -693,9 +968,17 @@ pub fn run_fix(
     plan_only: bool,
 ) -> Result<usize> {
     let mut total_fixes = 0;
+    // Shared SHA cache across every workflow in this run. Popular tags
+    // like `actions/checkout@v6` appearing in 12 workflows would
+    // otherwise cost 12 GitHub API round trips. The prewarm pass below
+    // pushes that further: it resolves every unique (action, tag) in
+    // parallel before any workflow fix runs, so the serial fix passes
+    // only see cache hits and emit output immediately.
+    let mut sha_cache: HashMap<String, Option<String>> = HashMap::new();
+    prewarm_sha_cache(workflows, github_token, &mut sha_cache);
 
     for workflow in workflows {
-        let result = fix_workflow(workflow, github_token);
+        let result = fix_workflow_cached(workflow, github_token, &mut sha_cache);
 
         if result.fixes.is_empty() {
             continue;
@@ -775,9 +1058,14 @@ pub fn run_fix_json(
 ) -> JsonOutput {
     let mut files = Vec::new();
     let mut total_fixes = 0;
+    // Shared SHA cache across every workflow in this run. See run_fix for
+    // the same optimization on the CLI path. prewarm_sha_cache fills
+    // the cache in parallel before the serial fix loop starts.
+    let mut sha_cache: HashMap<String, Option<String>> = HashMap::new();
+    prewarm_sha_cache(workflows, github_token, &mut sha_cache);
 
     for workflow in workflows {
-        let result = fix_workflow(workflow, github_token);
+        let result = fix_workflow_cached(workflow, github_token, &mut sha_cache);
         if result.fixes.is_empty() {
             continue;
         }
@@ -810,7 +1098,7 @@ pub fn run_fix_json(
 
 /// Base64-encode bytes using the standard alphabet with padding.
 /// Small local implementation so we don't pull in a new crate just for this.
-fn base64_encode(input: &[u8]) -> String {
+pub(crate) fn base64_encode(input: &[u8]) -> String {
     const ALPHA: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
     let mut i = 0;
@@ -840,36 +1128,36 @@ fn base64_encode(input: &[u8]) -> String {
 }
 
 #[derive(Deserialize)]
-struct RepoInfo {
-    default_branch: String,
+pub(crate) struct RepoInfo {
+    pub default_branch: String,
     #[serde(default)]
-    permissions: Option<RepoPermissions>,
+    pub permissions: Option<RepoPermissions>,
 }
 
 #[derive(Deserialize, Default)]
-struct RepoPermissions {
+pub(crate) struct RepoPermissions {
     #[serde(default)]
-    push: bool,
+    pub push: bool,
 }
 
 #[derive(Deserialize)]
-struct ContentsGet {
-    sha: String,
+pub(crate) struct ContentsGet {
+    pub sha: String,
 }
 
 #[derive(Deserialize)]
-struct PullRequestResp {
-    html_url: String,
+pub(crate) struct PullRequestResp {
+    pub html_url: String,
 }
 
 #[derive(Deserialize)]
-struct AuthUser {
-    login: String,
+pub(crate) struct AuthUser {
+    pub login: String,
 }
 
 /// Fork `upstream_owner/upstream_repo` under the authenticated user and wait
 /// until the fork is queryable. Returns `(fork_owner, fork_repo)`.
-fn fork_and_wait(
+pub(crate) fn fork_and_wait(
     client: &Client,
     api: &str,
     upstream_owner: &str,

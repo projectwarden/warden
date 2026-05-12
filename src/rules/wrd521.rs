@@ -1,10 +1,8 @@
 use regex::Regex;
 use std::sync::OnceLock;
 
-use super::{line_number_at_offset, Finding, Rule};
-use crate::scanner::Workflow;
-
-pub struct Wrd521;
+use super::{line_number_at_offset, AuditCtx, Rule, RuleFinding, RuleMeta, Severity};
+use crate::yamlpath::Span;
 
 fn re_pr_target_trigger() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
@@ -30,77 +28,80 @@ fn re_run_scripts_from_pr() -> &'static Regex {
     })
 }
 
+// ---------------------------------------------------------------------------
+// V2: path-gate on "dependabot" in the loaded path, raw-text scans mirroring
+// the legacy regexes. Like WRD-540, this targets dependabot.yml which reaches
+// rules via a stub workflow.
+// ---------------------------------------------------------------------------
+
+pub struct Wrd521;
+
 impl Rule for Wrd521 {
-    fn id(&self) -> &str {
-        "WRD-521"
-    }
-    fn name(&self) -> &str {
-        "Dependabot Insecure Execution"
-    }
-    fn severity(&self) -> &str {
-        "medium"
-    }
-    fn description(&self) -> &str {
-        "Detects Dependabot-related workflows that may execute untrusted code \
-         from pull requests via pull_request_target"
+    fn meta(&self) -> RuleMeta {
+        RuleMeta {
+            id: "WRD-521",
+            name: "Dependabot PR Untrusted Execution",
+            default_severity: Severity::Medium,
+            description: "Detects Dependabot-related workflows that may execute untrusted code \
+                          from pull requests via pull_request_target",
+        }
     }
 
-    fn check(&self, workflow: &Workflow) -> Vec<Finding> {
+    fn audit(&self, ctx: &AuditCtx) -> Vec<RuleFinding> {
+        if !ctx.loaded.path.to_string_lossy().contains("dependabot") {
+            return Vec::new();
+        }
+        let raw = &ctx.loaded.raw;
         let mut findings = Vec::new();
-        let content = &workflow.content;
 
-        let has_pr_target = re_pr_target_trigger().is_match(content);
-        if !has_pr_target {
+        if !re_pr_target_trigger().is_match(raw) {
+            return findings;
+        }
+        if !re_dependabot_actor().is_match(raw) {
             return findings;
         }
 
-        let mentions_dependabot = re_dependabot_actor().is_match(content);
-        if !mentions_dependabot {
-            return findings;
-        }
-
-        // Check for checkout of PR head ref (dangerous with pull_request_target)
-        if let Some(m) = re_checkout_pr_head().find(content) {
-            let line = line_number_at_offset(content, m.start());
-            findings.push(Finding {
-                rule_id: self.id().to_string(),
-                severity: self.severity().to_string(),
-                title: "Dependabot workflow checks out PR head in pull_request_target".to_string(),
-                description: "This workflow uses pull_request_target and checks out the \
-                    PR head ref. With pull_request_target, the workflow runs with \
-                    write permissions and access to secrets. Checking out untrusted \
-                    PR code in this context allows arbitrary code execution with \
-                    elevated privileges."
-                    .to_string(),
-                file: workflow.path.clone(),
-                line,
-                remediation: "Avoid checking out the PR head in pull_request_target \
-                    workflows. If you must, run untrusted code in a separate \
-                    unprivileged workflow triggered by pull_request instead."
-                    .to_string(),
+        if let Some(m) = re_checkout_pr_head().find(raw) {
+            let line = line_number_at_offset(raw, m.start());
+            let span = Span::new(m.start(), m.end(), line, 1, line, 1);
+            findings.push(RuleFinding {
+                rule_id: "WRD-521",
+                severity: Severity::Medium,
+                title: "Dependabot workflow checks out PR head in pull_request_target".into(),
+                description: "This workflow uses pull_request_target and checks out the PR head \
+                              ref. With pull_request_target, the workflow runs with write \
+                              permissions and access to secrets. Checking out untrusted PR code \
+                              in this context allows arbitrary code execution with elevated \
+                              privileges."
+                    .into(),
+                primary: span,
+                related: Vec::new(),
+                remediation: "Avoid checking out the PR head in pull_request_target workflows. \
+                              If you must, run untrusted code in a separate unprivileged \
+                              workflow triggered by pull_request instead."
+                    .into(),
             });
         }
 
-        // Check for running scripts (which execute from the checked-out code)
-        if re_checkout_pr_head().is_match(content) {
-            for m in re_run_scripts_from_pr().find_iter(content) {
-                let line = line_number_at_offset(content, m.start());
-                findings.push(Finding {
-                    rule_id: self.id().to_string(),
-                    severity: self.severity().to_string(),
-                    title: "Script execution in Dependabot pull_request_target workflow"
-                        .to_string(),
-                    description: "This pull_request_target workflow checks out PR code \
-                        and runs scripts. An attacker could modify Dependabot PRs \
-                        (or create PRs that match the conditions) to execute \
-                        arbitrary code with write permissions."
-                        .to_string(),
-                    file: workflow.path.clone(),
-                    line,
-                    remediation: "Move script execution to a pull_request-triggered \
-                        workflow (no write access). Use workflow_run to pass results \
-                        back to the privileged context if needed."
-                        .to_string(),
+        if re_checkout_pr_head().is_match(raw) {
+            for m in re_run_scripts_from_pr().find_iter(raw) {
+                let line = line_number_at_offset(raw, m.start());
+                let span = Span::new(m.start(), m.end(), line, 1, line, 1);
+                findings.push(RuleFinding {
+                    rule_id: "WRD-521",
+                    severity: Severity::Medium,
+                    title: "Script execution in Dependabot pull_request_target workflow".into(),
+                    description: "This pull_request_target workflow checks out PR code and runs \
+                                  scripts. An attacker could modify Dependabot PRs (or create \
+                                  PRs that match the conditions) to execute arbitrary code with \
+                                  write permissions."
+                        .into(),
+                    primary: span,
+                    related: Vec::new(),
+                    remediation: "Move script execution to a pull_request-triggered workflow \
+                                  (no write access). Use workflow_run to pass results back to \
+                                  the privileged context if needed."
+                        .into(),
                 });
             }
         }
